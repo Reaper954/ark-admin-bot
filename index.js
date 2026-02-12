@@ -1,170 +1,155 @@
 require("dotenv").config();
+
+const fs = require("fs");
+const path = require("path");
 const {
   Client,
   GatewayIntentBits,
-  PermissionFlagsBits,
-  EmbedBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
+  PermissionsBitField,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  EmbedBuilder,
 } = require("discord.js");
-const fs = require("fs");
-const path = require("path");
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// -------------------- crash protection --------------------
+process.on("unhandledRejection", (err) => console.error("UnhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("UncaughtException:", err));
 
-const WHITEFLAGS_FILE = path.join(__dirname, "whiteflags.json");
+// -------------------- storage files --------------------
 const SETTINGS_FILE = path.join(__dirname, "settings.json");
+const WHITEFLAGS_FILE = path.join(__dirname, "whiteflags.json");
 
-// ================= JSON helpers =================
-function loadJson(file, fallback) {
+// -------------------- IDs --------------------
+const BTN_100X = "whiteflag_btn:100x";
+const BTN_25X = "whiteflag_btn:25x";
+const MODAL_PREFIX = "whiteflag_modal:"; // whiteflag_modal:100x | whiteflag_modal:25x
+
+// -------------------- JSON helpers --------------------
+function readJsonSafe(filePath, fallback) {
   try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, "utf8");
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`Failed reading JSON: ${filePath}`, e);
     return fallback;
   }
 }
-function saveJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+
+function writeJsonSafe(filePath, data) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
+  } catch (e) {
+    console.error(`Failed writing JSON: ${filePath}`, e);
+  }
 }
 
-function loadWhiteflags() {
-  return loadJson(WHITEFLAGS_FILE, []);
-}
-function saveWhiteflags(items) {
-  saveJson(WHITEFLAGS_FILE, items);
-}
-
+// -------------------- settings (per guild) --------------------
 function loadSettings() {
-  // { [guildId]: { openSeasonChannelId, modLogChannelId, role100xId, role25xId } }
-  return loadJson(SETTINGS_FILE, {});
+  return readJsonSafe(SETTINGS_FILE, {});
 }
-function saveSettings(s) {
-  saveJson(SETTINGS_FILE, s);
+function saveSettings(all) {
+  writeJsonSafe(SETTINGS_FILE, all);
 }
 function getGuildSettings(guildId) {
   const all = loadSettings();
-  return all[guildId] || null;
+  return all[guildId] || {};
+}
+function setGuildSettings(guildId, patch) {
+  const all = loadSettings();
+  all[guildId] = { ...(all[guildId] || {}), ...patch };
+  saveSettings(all);
 }
 
-// ================= Time / prune =================
-function nowMs() {
-  return Date.now();
+// -------------------- whiteflags --------------------
+function loadWhiteflags() {
+  return readJsonSafe(WHITEFLAGS_FILE, []);
+}
+function saveWhiteflags(items) {
+  writeJsonSafe(WHITEFLAGS_FILE, items);
 }
 function pruneExpired(items) {
-  const t = nowMs();
-  const active = items.filter(x => x.expiresAt > t);
-  if (active.length !== items.length) saveWhiteflags(active);
-  return active;
+  const now = Date.now();
+  const kept = items.filter((x) => !x.expiresAt || x.expiresAt > now);
+  if (kept.length !== items.length) saveWhiteflags(kept);
+  return kept;
 }
 
-// ================= Cluster constants =================
-const CLUSTER_100X = "PVP Chaos 100x";
-const CLUSTER_25X = "PVP 25X";
-
-function normalizeClusterKey(key) {
-  const k = (key || "").toLowerCase().trim();
-  if (k === "100x") return "100x";
-  if (k === "25x") return "25x";
-  return "";
+// -------------------- helpers --------------------
+function isAdminMember(member) {
+  return member?.permissions?.has(PermissionsBitField.Flags.Administrator);
 }
 
-function clusterFromKey(key) {
-  const k = normalizeClusterKey(key);
-  if (k === "100x") return CLUSTER_100X;
-  if (k === "25x") return CLUSTER_25X;
-  return "";
+async function safeReply(interaction, payload) {
+  const already = interaction.deferred || interaction.replied;
+  if (already) return interaction.followUp(payload).catch(() => null);
+  return interaction.reply(payload).catch(() => null);
 }
 
-// ================= Role mention helper (exact) =================
-function getClusterRoleMention(guildId, clusterRaw) {
-  const s = getGuildSettings(guildId);
-  if (!s) return "";
+async function sendModLog(guild, text) {
+  try {
+    const s = getGuildSettings(guild.id);
+    if (!s.modLogChannelId) return;
 
-  const c = (clusterRaw || "").trim().toLowerCase();
+    const ch = await guild.channels.fetch(s.modLogChannelId).catch(() => null);
+    if (!ch) return;
 
-  if (c === CLUSTER_100X.toLowerCase()) return s.role100xId ? `<@&${s.role100xId}>` : "";
-  if (c === CLUSTER_25X.toLowerCase()) return s.role25xId ? `<@&${s.role25xId}>` : "";
-
-  return "";
+    await ch.send({ content: text });
+  } catch (e) {
+    console.error("sendModLog error:", e);
+  }
 }
 
-// ================= Modal builder (cluster locked) =================
-function buildWhiteflagModal(clusterKey) {
-  const cluster = clusterFromKey(clusterKey);
-  if (!cluster) return null;
+// -------------------- UI builders --------------------
+function buildFormButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(BTN_100X).setLabel("100x").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(BTN_25X).setLabel("25x").setStyle(ButtonStyle.Primary)
+  );
+}
 
+function buildWhiteflagModal(tier) {
   const modal = new ModalBuilder()
-    .setCustomId(`whiteflag_register_modal:${normalizeClusterKey(clusterKey)}`)
-    .setTitle(`White Flag Registration — ${cluster}`);
+    .setCustomId(`${MODAL_PREFIX}${tier}`)
+    .setTitle(`Whiteflag Request (${tier})`);
 
   const tribe = new TextInputBuilder()
     .setCustomId("tribe")
-    .setLabel("Tribe Name")
+    .setLabel("Tribe name")
     .setStyle(TextInputStyle.Short)
     .setRequired(true);
 
-  const ign = new TextInputBuilder()
-    .setCustomId("ign")
-    .setLabel("IGN")
+  const hours = new TextInputBuilder()
+    .setCustomId("hours")
+    .setLabel("Duration (hours)")
     .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
-  const mapcoords = new TextInputBuilder()
-    .setCustomId("mapcoords")
-    .setLabel("Map")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
+    .setRequired(true)
+    .setPlaceholder("Example: 24");
 
   const notes = new TextInputBuilder()
     .setCustomId("notes")
-    .setLabel("Tribe mates")
+    .setLabel("Notes / reason (optional)")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false);
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(tribe),
-    new ActionRowBuilder().addComponents(ign),
-    new ActionRowBuilder().addComponents(mapcoords),
+    new ActionRowBuilder().addComponents(hours),
     new ActionRowBuilder().addComponents(notes)
   );
 
   return modal;
 }
 
-// ================= Log helpers =================
-async function sendModLog(guild, embed) {
-  const settings = getGuildSettings(guild.id);
-  if (!settings?.modLogChannelId) return;
-
-  const ch = await guild.channels.fetch(settings.modLogChannelId).catch(() => null);
-  if (!ch) return;
-
-  await ch.send({ embeds: [embed], allowedMentions: { parse: ["roles"] } }).catch(() => null);
-}
-
-async function sendOpenSeason(guild, tribe, cluster, reason) {
-  const settings = getGuildSettings(guild.id);
-  if (!settings?.openSeasonChannelId) return;
-
-  const ch = await guild.channels.fetch(settings.openSeasonChannelId).catch(() => null);
-  if (!ch) return;
-
-  const ping = getClusterRoleMention(guild.id, cluster);
-
-  const text =
-    `${ping ? ping + "\n" : ""}` +
-    `🚨 **OPEN SEASON** 🚨\n` +
-    `White Flag has been removed for **${tribe}** on **${cluster}**.\n` +
-    (reason ? `Reason: **${reason}**\n` : "") +
-    `Raids are now allowed.`;
-
-  await ch.send({ content: text, allowedMentions: { parse: ["roles"] } }).catch(() => null);
-}
+// -------------------- client --------------------
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
 
 client.once("clientReady", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -172,243 +157,307 @@ client.once("clientReady", () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  // ================= Button click -> open modal =================
-  if (interaction.isButton() && interaction.customId.startsWith("whiteflag_button:")) {
-    const clusterKey = interaction.customId.split(":")[1];
-    const modal = buildWhiteflagModal(clusterKey);
-    if (!modal) {
-      return interaction.reply({ content: "❌ Invalid cluster button.", ephemeral: true });
-    }
-    await interaction.showModal(modal);
-    return;
-  }
+  try {
+    // ---------- MODAL SUBMIT ----------
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(MODAL_PREFIX)) {
+      const tier = interaction.customId.replace(MODAL_PREFIX, "");
+      const guild = interaction.guild;
 
-  // ================= Modal submit =================
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("whiteflag_register_modal:")) {
-    const clusterKey = interaction.customId.split(":")[1];
-    const cluster = clusterFromKey(clusterKey);
-    if (!cluster) {
-      return interaction.reply({ content: "❌ Invalid cluster form.", ephemeral: true });
-    }
+      if (!guild) {
+        return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+      }
 
-    const tribe = interaction.fields.getTextInputValue("tribe");
-    const ign = interaction.fields.getTextInputValue("ign");
-    const mapcoords = interaction.fields.getTextInputValue("mapcoords");
-    const notes = interaction.fields.getTextInputValue("notes") || "";
+      const tribe = interaction.fields.getTextInputValue("tribe").trim();
+      const hoursStr = interaction.fields.getTextInputValue("hours").trim();
+      const notes = (interaction.fields.getTextInputValue("notes") || "").trim();
 
-    let items = pruneExpired(loadWhiteflags());
+      const hours = Number(hoursStr);
+      if (!Number.isFinite(hours) || hours <= 0 || hours > 168) {
+        return safeReply(interaction, {
+          content: "❌ Duration must be a number between 1 and 168 hours.",
+          ephemeral: true,
+        });
+      }
 
-    const exists = items.find(
-      x => x.tribe.toLowerCase() === tribe.toLowerCase() && x.cluster.toLowerCase() === cluster.toLowerCase()
-    );
-    if (exists) {
-      return interaction.reply({
-        content: `⚠️ **${tribe}** already has an active White Flag on **${cluster}**.`,
+      const s = getGuildSettings(guild.id);
+      if (!s.openSeasonChannelId) {
+        return safeReply(interaction, {
+          content: "❌ Bot is not set up yet. Run /setup first.",
+          ephemeral: true,
+        });
+      }
+
+      const roleId = tier === "100x" ? s.role100xId : s.role25xId;
+      if (!roleId) {
+        return safeReply(interaction, {
+          content: "❌ Tier roles not set. Run /setup_roles first.",
+          ephemeral: true,
+        });
+      }
+
+      const expiresAt = Date.now() + hours * 60 * 60 * 1000;
+
+      let items = pruneExpired(loadWhiteflags());
+      const exists = items.find(
+        (x) => x.guildId === guild.id && x.tribe.toLowerCase() === tribe.toLowerCase()
+      );
+      if (exists) {
+        return safeReply(interaction, {
+          content: "❌ That tribe already has an active whiteflag.",
+          ephemeral: true,
+        });
+      }
+
+      const entry = {
+        guildId: guild.id,
+        tribe,
+        tier,
+        notes,
+        createdBy: interaction.user.id,
+        createdAt: Date.now(),
+        expiresAt,
+      };
+
+      items.push(entry);
+      saveWhiteflags(items);
+
+      const ch = await guild.channels.fetch(s.openSeasonChannelId).catch(() => null);
+      if (ch) {
+        const embed = new EmbedBuilder()
+          .setTitle("🏳️ Whiteflag Active")
+          .addFields(
+            { name: "Tribe", value: tribe, inline: true },
+            { name: "Tier", value: tier, inline: true },
+            { name: "Duration", value: `${hours}h`, inline: true },
+            { name: "Expires", value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true }
+          );
+
+        if (notes) embed.addFields({ name: "Notes", value: notes });
+
+        await ch.send({
+          content: `<@&${roleId}>`,
+          embeds: [embed],
+          allowedMentions: { parse: ["roles"] },
+        });
+      }
+
+      await sendModLog(
+        guild,
+        `✅ Whiteflag started: **${tribe}** (${tier}) by <@${interaction.user.id}> for ${hours}h`
+      );
+
+      return safeReply(interaction, {
+        content: `✅ Whiteflag started for **${tribe}** (${tier}) for **${hours}h**.`,
         ephemeral: true,
       });
     }
 
-    const createdAt = nowMs();
-    const expiresAt = createdAt + 7 * 24 * 60 * 60 * 1000;
+    // ---------- BUTTON ----------
+    if (interaction.isButton()) {
+      const guild = interaction.guild;
+      if (!guild) {
+        return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+      }
 
-    items.push({
-      tribe,
-      cluster,
-      ign,
-      mapcoords,
-      notes,
-      createdBy: interaction.user.tag,
-      createdAt,
-      expiresAt,
-    });
+      // Restrict button usage to configured open-season channel (if set)
+      const s = getGuildSettings(guild.id);
+      if (s.openSeasonChannelId && interaction.channelId !== s.openSeasonChannelId) {
+        return safeReply(interaction, {
+          content: "❌ Please use this in the open-season channel.",
+          ephemeral: true,
+        });
+      }
 
-    saveWhiteflags(items);
+      if (interaction.customId === BTN_100X) return interaction.showModal(buildWhiteflagModal("100x"));
+      if (interaction.customId === BTN_25X) return interaction.showModal(buildWhiteflagModal("25x"));
+      return;
+    }
 
-    const embed = new EmbedBuilder()
-      .setTitle("✅ White Flag Activated")
-      .addFields(
-        { name: "Tribe", value: tribe, inline: true },
-        { name: "Cluster", value: cluster, inline: true },
-        { name: "IGN", value: ign, inline: true },
-        { name: "Map / Coords", value: mapcoords, inline: false },
-        { name: "Expires", value: `<t:${Math.floor(expiresAt / 1000)}:F>`, inline: false },
-        { name: "Notes", value: notes || "None", inline: false }
+    // ---------- SLASH COMMAND ----------
+    if (!interaction.isChatInputCommand()) return;
+
+    const guild = interaction.guild;
+    if (!guild) {
+      return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+    }
+
+    const cmd = interaction.commandName;
+    const isAdmin = isAdminMember(interaction.member);
+
+    // ---- /setup ----
+    if (cmd === "setup") {
+      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      const openSeasonChannel = interaction.options.getChannel("open_season_channel", true);
+      const modLogChannel = interaction.options.getChannel("mod_log_channel", true);
+
+      setGuildSettings(guild.id, {
+        openSeasonChannelId: openSeasonChannel.id,
+        modLogChannelId: modLogChannel.id,
+      });
+
+      return safeReply(interaction, {
+        content: `✅ Setup complete.\n- Open season: <#${openSeasonChannel.id}>\n- Mod log: <#${modLogChannel.id}>`,
+        ephemeral: true,
+      });
+    }
+
+    // ---- /setup_roles ----
+    if (cmd === "setup_roles") {
+      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      const role100x = interaction.options.getRole("role_100x", true);
+      const role25x = interaction.options.getRole("role_25x", true);
+
+      setGuildSettings(guild.id, { role100xId: role100x.id, role25xId: role25x.id });
+
+      return safeReply(interaction, {
+        content: `✅ Roles saved.\n- 100x: <@&${role100x.id}>\n- 25x: <@&${role25x.id}>`,
+        ephemeral: true,
+      });
+    }
+
+    // ---- /post_whiteflag_buttons ----
+    if (cmd === "post_whiteflag_buttons") {
+      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      const s = getGuildSettings(guild.id);
+      if (!s.openSeasonChannelId) {
+        return safeReply(interaction, {
+          content: "❌ Run /setup first (open season channel not set).",
+          ephemeral: true,
+        });
+      }
+
+      const ch = await guild.channels.fetch(s.openSeasonChannelId).catch(() => null);
+      if (!ch) {
+        return safeReply(interaction, { content: "❌ Open season channel missing.", ephemeral: true });
+      }
+
+      await ch.send({
+        content: "Select a tier to submit a whiteflag request:",
+        components: [buildFormButtons()],
+      });
+
+      return safeReply(interaction, { content: "✅ Buttons posted.", ephemeral: true });
+    }
+
+    // ---- /rules ----
+    if (cmd === "rules") {
+      const rulesText =
+        "**🏳️ White Flag Rules**\n" +
+        "• Do not raid tribes with an active white flag.\n" +
+        "• White flag applies for the approved duration.\n" +
+        "• Any abuse may result in removal and punishment.\n" +
+        "• Staff decision is final.\n";
+
+      const channel = interaction.channel;
+      if (!channel) {
+        return safeReply(interaction, { content: "❌ Can't find a channel.", ephemeral: true });
+      }
+
+      await channel.send({ content: rulesText });
+      return safeReply(interaction, { content: "✅ Rules posted.", ephemeral: true });
+    }
+
+    // ---- /whiteflag_list ----
+    if (cmd === "whiteflag_list") {
+      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      let items = pruneExpired(loadWhiteflags()).filter((x) => x.guildId === guild.id);
+      if (!items.length) return safeReply(interaction, { content: "No active whiteflags.", ephemeral: true });
+
+      const lines = items
+        .sort((a, b) => a.expiresAt - b.expiresAt)
+        .map((x) => {
+          const exp = x.expiresAt ? `<t:${Math.floor(x.expiresAt / 1000)}:R>` : "N/A";
+          return `• **${x.tribe}** (${x.tier}) expires ${exp}`;
+        });
+
+      return safeReply(interaction, {
+        content: `**Active whiteflags:**\n${lines.join("\n")}`,
+        ephemeral: true,
+      });
+    }
+
+    // ---- /whiteflag_end ----
+    if (cmd === "whiteflag_end") {
+      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      const tribeInput = interaction.options.getString("tribe", true);
+      const reason = interaction.options.getString("reason") || "No reason provided";
+
+      let items = pruneExpired(loadWhiteflags());
+      const idx = items.findIndex(
+        (x) => x.guildId === guild.id && x.tribe.toLowerCase() === tribeInput.toLowerCase()
       );
 
-    await interaction.reply({ embeds: [embed] });
+      if (idx === -1) {
+        return safeReply(interaction, {
+          content: "❌ No active whiteflag found for that tribe.",
+          ephemeral: true,
+        });
+      }
 
-    const ping = getClusterRoleMention(interaction.guild.id, cluster);
-    if (ping) {
-      await interaction.channel.send({
-        content: `${ping} New White Flag registration: **${tribe}** (${cluster})`,
+      const ended = items[idx];
+      items.splice(idx, 1);
+      saveWhiteflags(items);
+
+      await sendModLog(
+        guild,
+        `🛑 Whiteflag ended: **${ended.tribe}** (${ended.tier}) by <@${interaction.user.id}> — Reason: ${reason}`
+      );
+
+      return safeReply(interaction, {
+        content: `✅ Ended whiteflag for **${ended.tribe}** (${ended.tier}).`,
+        ephemeral: true,
+      });
+    }
+
+    // ---- /ping100x and /ping25x ----
+    if (cmd === "ping100x" || cmd === "ping25x") {
+      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      const s = getGuildSettings(guild.id);
+      const roleId = cmd === "ping100x" ? s.role100xId : s.role25xId;
+      const tierName = cmd === "ping100x" ? "100x" : "25x";
+
+      if (!roleId) {
+        return safeReply(interaction, { content: "❌ Run /setup_roles first.", ephemeral: true });
+      }
+
+      const msg = interaction.options.getString("message") || `Ping for ${tierName}`;
+
+      const channel = interaction.channel;
+      if (!channel) {
+        return safeReply(interaction, {
+          content: "❌ Can't find a channel to send the ping.",
+          ephemeral: true,
+        });
+      }
+
+      await channel.send({
+        content: `<@&${roleId}> ${msg}`,
         allowedMentions: { parse: ["roles"] },
       });
+
+      return safeReply(interaction, { content: "✅ Ping sent.", ephemeral: true });
     }
 
-    const logEmbed = new EmbedBuilder()
-      .setTitle("📝 White Flag Registered")
-      .setDescription(`Registered by **${interaction.user.tag}**`)
-      .addFields(
-        { name: "Tribe", value: tribe, inline: true },
-        { name: "Cluster", value: cluster, inline: true },
-        { name: "Expires", value: `<t:${Math.floor(expiresAt / 1000)}:F>`, inline: false }
-      );
-
-    await sendModLog(interaction.guild, logEmbed);
-    return;
-  }
-
-  // ================= Slash commands =================
-  if (!interaction.isChatInputCommand()) return;
-
-  const cmd = interaction.commandName;
-  const guild = interaction.guild;
-
-  const isAdmin =
-    interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ||
-    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
-
-  if (cmd === "setup") {
-    if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });
-
-    const openSeasonChannel = interaction.options.getChannel("open_season_channel", true);
-    const modLogChannel = interaction.options.getChannel("mod_log_channel", true);
-
-    const all = loadSettings();
-    all[guild.id] = {
-      ...(all[guild.id] || {}),
-      openSeasonChannelId: openSeasonChannel.id,
-      modLogChannelId: modLogChannel.id,
-    };
-    saveSettings(all);
-
-    const embed = new EmbedBuilder()
-      .setTitle("✅ Setup Saved")
-      .addFields(
-        { name: "Open Season Channel", value: `<#${openSeasonChannel.id}>`, inline: false },
-        { name: "Mod Log Channel", value: `<#${modLogChannel.id}>`, inline: false }
-      );
-
-    await interaction.reply({ embeds: [embed], ephemeral: true });
-    return;
-  }
-
-  if (cmd === "setup_roles") {
-    if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });
-
-    const role100x = interaction.options.getRole("role_100x", true);
-    const role25x = interaction.options.getRole("role_25x", true);
-
-    const all = loadSettings();
-    all[guild.id] = {
-      ...(all[guild.id] || {}),
-      role100xId: role100x.id,
-      role25xId: role25x.id,
-    };
-    saveSettings(all);
-
-    const embed = new EmbedBuilder()
-      .setTitle("✅ Role Ping Setup Saved")
-      .addFields(
-        { name: "PVP Chaos 100x Role", value: `<@&${role100x.id}>`, inline: false },
-        { name: "PVP 25X Role", value: `<@&${role25x.id}>`, inline: false }
-      );
-
-    await interaction.reply({ embeds: [embed], ephemeral: true });
-    return;
-  }
-
-  if (cmd === "post_whiteflag_buttons") {
-    if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });
-
-    const embed = new EmbedBuilder()
-      .setTitle("🟢 White Flag Registration")
-      .setDescription("Choose your cluster, then fill out the form.");
-
-    const b100 = new ButtonBuilder()
-      .setCustomId("whiteflag_button:100x")
-      .setLabel(CLUSTER_100X)
-      .setStyle(ButtonStyle.Success);
-
-    const b25 = new ButtonBuilder()
-      .setCustomId("whiteflag_button:25x")
-      .setLabel(CLUSTER_25X)
-      .setStyle(ButtonStyle.Primary);
-
-    const row = new ActionRowBuilder().addComponents(b100, b25);
-
-    await interaction.channel.send({ embeds: [embed], components: [row] });
-    await interaction.reply({ content: "✅ Buttons posted.", ephemeral: true });
-    return;
-  }
-
-  if (cmd === "rules") {
-    const rulesText =
-      "**🟢 White Flag System**\n" +
-      "- White Flag gives new players **7 days** to build up.\n" +
-      "- **You are NOT allowed to raid while your White Flag is up.**\n" +
-      "- Raiding during White Flag = immediate removal + open season announcement.\n";
-
-    const embed = new EmbedBuilder().setTitle("White Flag Rules").setDescription(rulesText);
-    await interaction.reply({ embeds: [embed] });
-    return;
-  }
-
-  if (cmd === "whiteflag_list") {
-    const items = pruneExpired(loadWhiteflags());
-
-    if (!items.length) {
-      return interaction.reply({ content: "No active White Flags.", ephemeral: true });
+    // fallback
+    return safeReply(interaction, { content: "❓ Unknown command.", ephemeral: true });
+  } catch (err) {
+    console.error("interactionCreate error:", err);
+    if (interaction.isRepliable()) {
+      await safeReply(interaction, { content: "❌ Something went wrong.", ephemeral: true });
     }
-
-    const lines = items
-      .sort((a, b) => a.expiresAt - b.expiresAt)
-      .map(x => `• **${x.tribe}** (${x.cluster}) — expires <t:${Math.floor(x.expiresAt / 1000)}:R>`)
-      .join("\n");
-
-    const embed = new EmbedBuilder().setTitle("Active White Flags").setDescription(lines);
-    await interaction.reply({ embeds: [embed], ephemeral: true });
-    return;
-  }
-
-  if (cmd === "whiteflag_end") {
-    if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });
-
-    const tribeInput = interaction.options.getString("tribe", true);
-    const reason = interaction.options.getString("reason") || "";
-
-    let items = pruneExpired(loadWhiteflags());
-    const toEnd = items.find(x => x.tribe.toLowerCase() === tribeInput.toLowerCase());
-
-    if (!toEnd) {
-      return interaction.reply({
-        content: `Could not find an active White Flag for **${tribeInput}**.`,
-        ephemeral: true,
-      });
-    }
-
-    items = items.filter(x => x !== toEnd);
-    saveWhiteflags(items);
-
-    await interaction.reply({
-      content: `✅ Ended White Flag early for **${toEnd.tribe}**.`,
-      ephemeral: true,
-    });
-
-    await sendOpenSeason(guild, toEnd.tribe, toEnd.cluster, reason);
-
-    const logEmbed = new EmbedBuilder()
-      .setTitle("🚫 White Flag Ended Early")
-      .setDescription(`Ended by **${interaction.user.tag}**`)
-      .addFields(
-        { name: "Tribe", value: toEnd.tribe, inline: true },
-        { name: "Cluster", value: toEnd.cluster, inline: true },
-        { name: "Reason", value: reason || "None", inline: false }
-      );
-
-    await sendModLog(guild, logEmbed);
-    return;
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// -------------------- login --------------------
+const token = process.env.TOKEN;
+if (!token) {
+  console.error("❌ Missing TOKEN in .env");
+  process.exit(1);
+}
+client.login(token);
