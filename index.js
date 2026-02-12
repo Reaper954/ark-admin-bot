@@ -1,5 +1,7 @@
 require("dotenv").config();
 const {
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   GatewayIntentBits,
   PermissionFlagsBits,
@@ -105,6 +107,53 @@ client.once("ready", () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   pruneExpired(loadWhiteflags());
 });
+// Button click handler
+if (interaction.isButton() && interaction.customId === "whiteflag_button") {
+  const modal = new ModalBuilder()
+    .setCustomId("whiteflag_register_modal")
+    .setTitle("White Flag Registration");
+
+  const tribe = new TextInputBuilder()
+    .setCustomId("tribe")
+    .setLabel("Tribe Name")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  const cluster = new TextInputBuilder()
+    .setCustomId("cluster")
+    .setLabel("Cluster (100x / 25x)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  const ign = new TextInputBuilder()
+    .setCustomId("ign")
+    .setLabel("In-Game Name")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  const mapcoords = new TextInputBuilder()
+    .setCustomId("mapcoords")
+    .setLabel("Map & Coordinates")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  const notes = new TextInputBuilder()
+    .setCustomId("notes")
+    .setLabel("Notes")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(tribe),
+    new ActionRowBuilder().addComponents(cluster),
+    new ActionRowBuilder().addComponents(ign),
+    new ActionRowBuilder().addComponents(mapcoords),
+    new ActionRowBuilder().addComponents(notes)
+  );
+
+  await interaction.showModal(modal);
+  return;
+}
 
 // ---------- Interactions ----------
 client.on("interactionCreate", async (interaction) => {
@@ -265,6 +314,25 @@ if (cmd === "setup_roles") {
     await interaction.reply({ embeds: [embed] });
     return;
   }
+if (cmd === "post_whiteflag_button") {
+  if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });
+
+  const embed = new EmbedBuilder()
+    .setTitle("🟢 White Flag Registration")
+    .setDescription("Click the button below to register your tribe for White Flag protection.");
+
+  const button = new ButtonBuilder()
+    .setCustomId("whiteflag_button")
+    .setLabel("Register White Flag")
+    .setStyle(ButtonStyle.Success);
+
+  const row = new ActionRowBuilder().addComponents(button);
+
+  await interaction.channel.send({ embeds: [embed], components: [row] });
+
+  await interaction.reply({ content: "✅ Button posted.", ephemeral: true });
+  return;
+}
 
   if (cmd === "whiteflag_form") {
     // Modal = your “form”
@@ -344,6 +412,13 @@ if (cmd === "setup_roles") {
       expiresAt,
     });
     saveWhiteflags(items);
+const ping = getClusterRoleMention(guild.id, cluster);
+if (ping) {
+  await interaction.channel.send({
+    content: `${ping} New White Flag registration: **${tribe}** (${cluster})`,
+    allowedMentions: { parse: ["roles"] }
+  });
+}
 
     const embed = new EmbedBuilder()
       .setTitle("✅ White Flag Activated")

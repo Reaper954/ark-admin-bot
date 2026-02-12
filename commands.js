@@ -68,6 +68,11 @@ const commands = [
         .setDescription("Role to ping for 25x cluster")
         .setRequired(true)
     ),
+    new SlashCommandBuilder()
+  .setName("post_whiteflag_button")
+  .setDescription("Post the White Flag registration button")
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
