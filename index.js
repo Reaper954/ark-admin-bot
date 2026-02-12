@@ -49,6 +49,17 @@ function getGuildSettings(guildId) {
   const all = loadSettings();
   return all[guildId] || null;
 }
+function getClusterRoleMention(guildId, clusterRaw) {
+  const s = getGuildSettings(guildId);
+  if (!s) return "";
+
+  const cluster = (clusterRaw || "").toLowerCase();
+
+  if (cluster.includes("100")) return s.role100xId ? `<@&${s.role100xId}>` : "";
+  if (cluster.includes("25")) return s.role25xId ? `<@&${s.role25xId}>` : "";
+
+  return "";
+}
 
 // ---------- Time / pruning ----------
 function nowMs() {
@@ -79,8 +90,10 @@ async function sendOpenSeason(guild, tribe, cluster, reason) {
   const ch = await guild.channels.fetch(settings.openSeasonChannelId).catch(() => null);
   if (!ch) return;
 
+  const ping = getClusterRoleMention(guild.id, cluster);
+
   const text =
-    `🚨 **OPEN SEASON** 🚨\n` +
+    `${ping ? ping + "\n" : ""}🚨 **OPEN SEASON** 🚨\n` +
     `White Flag has been removed for **${tribe}** on **${cluster}**.\n` +
     (reason ? `Reason: **${reason}**\n` : "") +
     `Raids are now allowed.`;
@@ -133,6 +146,10 @@ client.on("interactionCreate", async (interaction) => {
 
     items.push(record);
     saveWhiteflags(items);
+const ping = getClusterRoleMention(interaction.guild.id, cluster);
+if (ping) {
+  await interaction.channel.send(`${ping} New White Flag registration: **${tribe}** (${cluster})`);
+}
 
     const embed = new EmbedBuilder()
       .setTitle("✅ White Flag Activated (Form)")
@@ -194,6 +211,30 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.reply({ embeds: [embed], ephemeral: true });
     return;
   }
+if (cmd === "setup_roles") {
+  if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });
+
+  const role100x = interaction.options.getRole("role_100x", true);
+  const role25x = interaction.options.getRole("role_25x", true);
+
+  const all = loadSettings();
+  all[guild.id] = {
+    ...(all[guild.id] || {}),
+    role100xId: role100x.id,
+    role25xId: role25x.id,
+  };
+  saveSettings(all);
+
+  const embed = new EmbedBuilder()
+    .setTitle("✅ Role Ping Setup Saved")
+    .addFields(
+      { name: "100x Role", value: `<@&${role100x.id}>`, inline: false },
+      { name: "25x Role", value: `<@&${role25x.id}>`, inline: false }
+    );
+
+  await interaction.reply({ embeds: [embed], ephemeral: true });
+  return;
+}
 
   if (cmd === "announce") {
     if (!isAdmin) return interaction.reply({ content: "❌ No permission.", ephemeral: true });

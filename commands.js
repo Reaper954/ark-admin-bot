@@ -53,6 +53,21 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o => o.setName("tribe").setDescription("Tribe name").setRequired(true))
     .addStringOption(o => o.setName("reason").setDescription("Reason (optional)").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("setup_roles")
+    .setDescription("Set staff roles to ping per cluster")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addRoleOption(o =>
+      o.setName("role_100x")
+        .setDescription("Role to ping for 100x cluster")
+        .setRequired(true)
+    )
+    .addRoleOption(o =>
+      o.setName("role_25x")
+        .setDescription("Role to ping for 25x cluster")
+        .setRequired(true)
+    ),
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
