@@ -13,22 +13,27 @@ const {
   TextInputBuilder,
   TextInputStyle,
   EmbedBuilder,
+  ChannelType,
 } = require("discord.js");
+
+// ==================== CONFIG ====================
+const FIXED_DURATION_HOURS = 168; // 7 days
+const SETTINGS_FILE = path.join(__dirname, "settings.json");
+const WHITEFLAGS_FILE = path.join(__dirname, "whiteflags.json");
+
+// Custom IDs
+const BTN_100X = "whiteflag_btn:100x";
+const BTN_25X = "whiteflag_btn:25x";
+const USER_MODAL_PREFIX = "whiteflag_modal:"; // whiteflag_modal:100x | whiteflag_modal:25x
+
+const REVIEW_PREFIX = "wf_review:"; // wf_review:approve:<id> | wf_review:deny:<id>
+const STAFF_APPROVE_MODAL_PREFIX = "wf_staff_approve:"; // wf_staff_approve:<id>
 
 // -------------------- crash protection --------------------
 process.on("unhandledRejection", (err) => console.error("UnhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("UncaughtException:", err));
 
-// -------------------- storage files --------------------
-const SETTINGS_FILE = path.join(__dirname, "settings.json");
-const WHITEFLAGS_FILE = path.join(__dirname, "whiteflags.json");
-
-// -------------------- IDs --------------------
-const BTN_100X = "whiteflag_btn:100x";
-const BTN_25X = "whiteflag_btn:25x";
-const MODAL_PREFIX = "whiteflag_modal:"; // whiteflag_modal:100x | whiteflag_modal:25x
-
-// -------------------- JSON helpers --------------------
+// ==================== JSON helpers ====================
 function readJsonSafe(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -40,7 +45,6 @@ function readJsonSafe(filePath, fallback) {
     return fallback;
   }
 }
-
 function writeJsonSafe(filePath, data) {
   try {
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
@@ -49,7 +53,7 @@ function writeJsonSafe(filePath, data) {
   }
 }
 
-// -------------------- settings (per guild) --------------------
+// ==================== Settings (per guild) ====================
 function loadSettings() {
   return readJsonSafe(SETTINGS_FILE, {});
 }
@@ -65,22 +69,46 @@ function setGuildSettings(guildId, patch) {
   all[guildId] = { ...(all[guildId] || {}), ...patch };
   saveSettings(all);
 }
+function assertSetup(guildId) {
+  const s = getGuildSettings(guildId);
+  const missing = [];
+  if (!s.openSeasonChannelId) missing.push("open season channel");
+  if (!s.reviewChannelId) missing.push("review channel");
+  if (!s.modLogChannelId) missing.push("mod log channel");
+  // roles are optional now since duration fixed; keep if you still want /ping commands
+  // if (!s.role100xId) missing.push("100x role");
+  // if (!s.role25xId) missing.push("25x role");
+  return { ok: missing.length === 0, missing, s };
+}
 
-// -------------------- whiteflags --------------------
+// ==================== Whiteflags (JSON array) ====================
 function loadWhiteflags() {
   return readJsonSafe(WHITEFLAGS_FILE, []);
 }
 function saveWhiteflags(items) {
   writeJsonSafe(WHITEFLAGS_FILE, items);
 }
-function pruneExpired(items) {
+function makeId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+function normalizeTier(tier) {
+  return tier === "100x" ? "100x" : "25x";
+}
+function pruneExpiredWithReport(items) {
   const now = Date.now();
-  const kept = items.filter((x) => !x.expiresAt || x.expiresAt > now);
+  const expired = [];
+  const kept = [];
+
+  for (const x of items) {
+    if (x.status === "active" && x.expiresAt && x.expiresAt <= now) expired.push(x);
+    else kept.push(x);
+  }
+
   if (kept.length !== items.length) saveWhiteflags(kept);
-  return kept;
+  return { kept, expired };
 }
 
-// -------------------- helpers --------------------
+// ==================== Helpers ====================
 function isAdminMember(member) {
   return member?.permissions?.has(PermissionsBitField.Flags.Administrator);
 }
@@ -91,21 +119,40 @@ async function safeReply(interaction, payload) {
   return interaction.reply(payload).catch(() => null);
 }
 
+async function sendToChannelId(guild, channelId, payload) {
+  if (!channelId) return null;
+  const ch = await guild.channels.fetch(channelId).catch(() => null);
+  if (!ch) return null;
+  return ch.send(payload).catch(() => null);
+}
+
 async function sendModLog(guild, text) {
+  const s = getGuildSettings(guild.id);
+  return sendToChannelId(guild, s.modLogChannelId, { content: text });
+}
+
+async function sendOpenSeason(guild, payload) {
+  const s = getGuildSettings(guild.id);
+  return sendToChannelId(guild, s.openSeasonChannelId, payload);
+}
+
+async function sendReview(guild, payload) {
+  const s = getGuildSettings(guild.id);
+  return sendToChannelId(guild, s.reviewChannelId, payload);
+}
+
+async function tryDM(client, userId, payload) {
   try {
-    const s = getGuildSettings(guild.id);
-    if (!s.modLogChannelId) return;
-
-    const ch = await guild.channels.fetch(s.modLogChannelId).catch(() => null);
-    if (!ch) return;
-
-    await ch.send({ content: text });
-  } catch (e) {
-    console.error("sendModLog error:", e);
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (!user) return false;
+    await user.send(payload).catch(() => null);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-// -------------------- UI builders --------------------
+// ==================== UI builders ====================
 function buildFormButtons() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(BTN_100X).setLabel("100x").setStyle(ButtonStyle.Danger),
@@ -113,196 +160,383 @@ function buildFormButtons() {
   );
 }
 
-function buildWhiteflagModal(tier) {
+// USER REQUEST MODAL (your requested fields)
+function buildUserRequestModal(tier) {
   const modal = new ModalBuilder()
-    .setCustomId(`${MODAL_PREFIX}${tier}`)
+    .setCustomId(`${USER_MODAL_PREFIX}${tier}`)
     .setTitle(`Whiteflag Request (${tier})`);
+
+  const ign = new TextInputBuilder()
+    .setCustomId("ign")
+    .setLabel("IGN")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(2)
+    .setMaxLength(32)
+    .setPlaceholder("Example: Cookm");
 
   const tribe = new TextInputBuilder()
     .setCustomId("tribe")
-    .setLabel("Tribe name")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
-  const hours = new TextInputBuilder()
-    .setCustomId("hours")
-    .setLabel("Duration (hours)")
+    .setLabel("Tribe")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
-    .setPlaceholder("Example: 24");
+    .setMinLength(2)
+    .setMaxLength(40)
+    .setPlaceholder("Example: The Bloodhounds");
 
-  const notes = new TextInputBuilder()
-    .setCustomId("notes")
-    .setLabel("Notes / reason (optional)")
+  const map = new TextInputBuilder()
+    .setCustomId("map")
+    .setLabel("Map")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(2)
+    .setMaxLength(40)
+    .setPlaceholder("Example: The Island / Fjordur / Center");
+
+  const tribemates = new TextInputBuilder()
+    .setCustomId("tribemates")
+    .setLabel("Tribemates (optional)")
     .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false);
+    .setRequired(false)
+    .setMaxLength(300)
+    .setPlaceholder("Example: Player1, Player2, Player3");
 
   modal.addComponents(
+    new ActionRowBuilder().addComponents(ign),
     new ActionRowBuilder().addComponents(tribe),
-    new ActionRowBuilder().addComponents(hours),
-    new ActionRowBuilder().addComponents(notes)
+    new ActionRowBuilder().addComponents(map),
+    new ActionRowBuilder().addComponents(tribemates)
   );
 
   return modal;
 }
 
-// -------------------- client --------------------
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+function buildReviewButtons(requestId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${REVIEW_PREFIX}approve:${requestId}`)
+      .setLabel("Approve (7 days)")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`${REVIEW_PREFIX}deny:${requestId}`)
+      .setLabel("Deny")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
 
-client.once("clientReady", () => {
+// Optional staff note modal (NO duration input)
+function buildStaffApproveModal(requestId, entry) {
+  const modal = new ModalBuilder()
+    .setCustomId(`${STAFF_APPROVE_MODAL_PREFIX}${requestId}`)
+    .setTitle(`Approve: ${entry.tribe} (${entry.tier})`);
+
+  const staffNote = new TextInputBuilder()
+    .setCustomId("staff_note")
+    .setLabel("Staff note (optional)")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setMaxLength(300)
+    .setPlaceholder("Optional note for logs/DM");
+
+  modal.addComponents(new ActionRowBuilder().addComponents(staffNote));
+  return modal;
+}
+
+function buildReviewEmbed(entry) {
+  const embed = new EmbedBuilder()
+    .setTitle("📝 Whiteflag Request (Pending Staff Review)")
+    .addFields(
+      { name: "Tier", value: `**${entry.tier}**`, inline: true },
+      { name: "IGN", value: `**${entry.ign}**`, inline: true },
+      { name: "Tribe", value: `**${entry.tribe}**`, inline: true },
+      { name: "Map", value: entry.map, inline: true },
+      { name: "Requested By", value: `<@${entry.requestedBy}>`, inline: true },
+      { name: "Request ID", value: `\`${entry.id}\``, inline: false }
+    );
+
+  if (entry.tribemates) embed.addFields({ name: "Tribemates", value: entry.tribemates, inline: false });
+
+  return embed;
+}
+
+// ==================== Discord client ====================
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+// v14 uses "ready"; v15 uses "clientReady" (safe to listen to both)
+let ranReady = false;
+function onReady() {
+  if (ranReady) return;
+  ranReady = true;
+
   console.log(`✅ Logged in as ${client.user.tag}`);
-  pruneExpired(loadWhiteflags());
-});
+
+  // Auto-expire loop: log + DM only (NO open-season announcements)
+  setInterval(async () => {
+    try {
+      const all = loadWhiteflags();
+      const { expired } = pruneExpiredWithReport(all);
+      if (!expired.length) return;
+
+      const byGuild = new Map();
+      for (const e of expired) {
+        if (!byGuild.has(e.guildId)) byGuild.set(e.guildId, []);
+        byGuild.get(e.guildId).push(e);
+      }
+
+      for (const [guildId, entries] of byGuild) {
+        const guild = await client.guilds.fetch(guildId).catch(() => null);
+        if (!guild) continue;
+
+        for (const e of entries) {
+          await sendModLog(
+            guild,
+            `⏱️ Whiteflag expired: **${e.tribe}** (${e.tier}) (requested by <@${e.requestedBy}>)`
+          );
+
+          await tryDM(client, e.requestedBy, {
+            content: `⏱️ Your whiteflag expired in **${guild.name}**.\nTribe: **${e.tribe}** (${e.tier})`,
+          });
+        }
+      }
+    } catch (err) {
+      console.error("auto-expire loop error:", err);
+    }
+  }, 60_000);
+}
+client.once("ready", onReady);
+client.once("clientReady", onReady);
 
 client.on("interactionCreate", async (interaction) => {
   try {
-    // ---------- MODAL SUBMIT ----------
-    if (interaction.isModalSubmit() && interaction.customId.startsWith(MODAL_PREFIX)) {
-      const tier = interaction.customId.replace(MODAL_PREFIX, "");
+    // ===================== STAFF APPROVE MODAL SUBMIT =====================
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(STAFF_APPROVE_MODAL_PREFIX)) {
       const guild = interaction.guild;
+      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+      if (!isAdminMember(interaction.member)) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
-      if (!guild) {
-        return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-      }
+      const requestId = interaction.customId.replace(STAFF_APPROVE_MODAL_PREFIX, "").trim();
+      const staffNote = (interaction.fields.getTextInputValue("staff_note") || "").trim();
 
-      const tribe = interaction.fields.getTextInputValue("tribe").trim();
-      const hoursStr = interaction.fields.getTextInputValue("hours").trim();
-      const notes = (interaction.fields.getTextInputValue("notes") || "").trim();
+      const { ok, missing } = assertSetup(guild.id);
+      if (!ok) return safeReply(interaction, { content: `❌ Missing setup: ${missing.join(", ")}`, ephemeral: true });
 
-      const hours = Number(hoursStr);
-      if (!Number.isFinite(hours) || hours <= 0 || hours > 168) {
-        return safeReply(interaction, {
-          content: "❌ Duration must be a number between 1 and 168 hours.",
-          ephemeral: true,
-        });
-      }
+      // prune expired before actions
+      const { kept } = pruneExpiredWithReport(loadWhiteflags());
+      let items = kept;
 
-      const s = getGuildSettings(guild.id);
-      if (!s.openSeasonChannelId) {
-        return safeReply(interaction, {
-          content: "❌ Bot is not set up yet. Run /setup first.",
-          ephemeral: true,
-        });
-      }
+      const idx = items.findIndex((x) => x.guildId === guild.id && x.id === requestId);
+      if (idx === -1) return safeReply(interaction, { content: "❌ Request not found.", ephemeral: true });
 
-      const roleId = tier === "100x" ? s.role100xId : s.role25xId;
-      if (!roleId) {
-        return safeReply(interaction, {
-          content: "❌ Tier roles not set. Run /setup_roles first.",
-          ephemeral: true,
-        });
-      }
+      const entry = items[idx];
+      if (entry.status !== "pending") return safeReply(interaction, { content: `❌ Request already **${entry.status}**.`, ephemeral: true });
 
-      const expiresAt = Date.now() + hours * 60 * 60 * 1000;
+      // Approve fixed duration
+      entry.status = "active";
+      entry.durationHours = FIXED_DURATION_HOURS;
+      entry.approvedBy = interaction.user.id;
+      entry.approvedAt = Date.now();
+      entry.expiresAt = Date.now() + FIXED_DURATION_HOURS * 60 * 60 * 1000;
+      if (staffNote) entry.staffNote = staffNote;
 
-      let items = pruneExpired(loadWhiteflags());
-      const exists = items.find(
-        (x) => x.guildId === guild.id && x.tribe.toLowerCase() === tribe.toLowerCase()
+      items[idx] = entry;
+      saveWhiteflags(items);
+
+      // disable review buttons on the review message
+      await interaction.message?.edit({ components: [] }).catch(() => null);
+
+      await sendModLog(
+        guild,
+        `✅ Whiteflag approved: **${entry.tribe}** (${entry.tier}) by <@${interaction.user.id}> — Duration: 7 days — Expires <t:${Math.floor(entry.expiresAt / 1000)}:R>` +
+          (staffNote ? ` — Note: ${staffNote}` : "")
       );
-      if (exists) {
-        return safeReply(interaction, {
-          content: "❌ That tribe already has an active whiteflag.",
-          ephemeral: true,
+
+      await tryDM(client, entry.requestedBy, {
+        content:
+          `✅ Your whiteflag was approved in **${guild.name}**.\n` +
+          `Tribe: **${entry.tribe}** (${entry.tier})\n` +
+          `Duration: **7 days**\n` +
+          `Expires: <t:${Math.floor(entry.expiresAt / 1000)}:R>` +
+          (staffNote ? `\nStaff note: ${staffNote}` : ""),
+      });
+
+      return safeReply(interaction, { content: "✅ Approved for 7 days.", ephemeral: true });
+    }
+
+    // ===================== REVIEW BUTTONS =====================
+    if (interaction.isButton() && interaction.customId.startsWith(REVIEW_PREFIX)) {
+      const guild = interaction.guild;
+      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+      if (!isAdminMember(interaction.member)) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+
+      const [, action, requestId] = interaction.customId.split(":");
+      if (!action || !requestId) return safeReply(interaction, { content: "❌ Invalid action.", ephemeral: true });
+
+      const { ok, missing } = assertSetup(guild.id);
+      if (!ok) return safeReply(interaction, { content: `❌ Missing setup: ${missing.join(", ")}`, ephemeral: true });
+
+      const { kept } = pruneExpiredWithReport(loadWhiteflags());
+      let items = kept;
+
+      const idx = items.findIndex((x) => x.guildId === guild.id && x.id === requestId);
+      if (idx === -1) return safeReply(interaction, { content: "❌ Request not found.", ephemeral: true });
+
+      const entry = items[idx];
+      if (entry.status !== "pending") return safeReply(interaction, { content: `❌ Request already **${entry.status}**.`, ephemeral: true });
+
+      if (action === "deny") {
+        items.splice(idx, 1);
+        saveWhiteflags(items);
+
+        await interaction.message?.edit({ components: [] }).catch(() => null);
+
+        await sendModLog(
+          guild,
+          `❌ Whiteflag denied: **${entry.tribe}** (${entry.tier}) by <@${interaction.user.id}> (requested by <@${entry.requestedBy}>)`
+        );
+
+        await tryDM(client, entry.requestedBy, {
+          content:
+            `❌ Your whiteflag request was denied in **${guild.name}**.\n` +
+            `Tribe: **${entry.tribe}** (${entry.tier})`,
         });
+
+        return safeReply(interaction, { content: "✅ Denied.", ephemeral: true });
+      }
+
+      if (action === "approve") {
+        // open staff note modal (duration fixed, so no hours asked)
+        return interaction.showModal(buildStaffApproveModal(requestId, entry));
+      }
+
+      return safeReply(interaction, { content: "❌ Unknown action.", ephemeral: true });
+    }
+
+    // ===================== USER MODAL SUBMIT (REQUEST) =====================
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(USER_MODAL_PREFIX)) {
+      const guild = interaction.guild;
+      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+
+      const tier = normalizeTier(interaction.customId.replace(USER_MODAL_PREFIX, ""));
+
+      const ign = interaction.fields.getTextInputValue("ign").trim();
+      const tribe = interaction.fields.getTextInputValue("tribe").trim();
+      const map = interaction.fields.getTextInputValue("map").trim();
+      const tribemates = (interaction.fields.getTextInputValue("tribemates") || "").trim();
+
+      if (ign.length < 2) return safeReply(interaction, { content: "❌ IGN is too short.", ephemeral: true });
+      if (tribe.length < 2) return safeReply(interaction, { content: "❌ Tribe is too short.", ephemeral: true });
+      if (map.length < 2) return safeReply(interaction, { content: "❌ Map is too short.", ephemeral: true });
+
+      const { ok, missing } = assertSetup(guild.id);
+      if (!ok) return safeReply(interaction, { content: `❌ Missing setup: ${missing.join(", ")}`, ephemeral: true });
+
+      // prune expired then check duplicates
+      const { kept } = pruneExpiredWithReport(loadWhiteflags());
+      let items = kept;
+
+      const dup = items.find(
+        (x) =>
+          x.guildId === guild.id &&
+          x.tribe.toLowerCase() === tribe.toLowerCase() &&
+          (x.status === "pending" || x.status === "active")
+      );
+      if (dup) {
+        return safeReply(interaction, { content: "❌ That tribe already has a pending/active whiteflag.", ephemeral: true });
       }
 
       const entry = {
+        id: makeId(),
         guildId: guild.id,
-        tribe,
         tier,
-        notes,
-        createdBy: interaction.user.id,
-        createdAt: Date.now(),
-        expiresAt,
+        ign,
+        tribe,
+        map,
+        tribemates: tribemates || null,
+        status: "pending",
+        requestedBy: interaction.user.id,
+        requestedAt: Date.now(),
       };
 
       items.push(entry);
       saveWhiteflags(items);
 
-      const ch = await guild.channels.fetch(s.openSeasonChannelId).catch(() => null);
-      if (ch) {
-        const embed = new EmbedBuilder()
-          .setTitle("🏳️ Whiteflag Active")
-          .addFields(
-            { name: "Tribe", value: tribe, inline: true },
-            { name: "Tier", value: tier, inline: true },
-            { name: "Duration", value: `${hours}h`, inline: true },
-            { name: "Expires", value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true }
-          );
+      const reviewMsg = await sendReview(guild, {
+        embeds: [buildReviewEmbed(entry)],
+        components: [buildReviewButtons(entry.id)],
+      });
 
-        if (notes) embed.addFields({ name: "Notes", value: notes });
-
-        await ch.send({
-          content: `<@&${roleId}>`,
-          embeds: [embed],
-          allowedMentions: { parse: ["roles"] },
-        });
+      if (!reviewMsg) {
+        // rollback if review channel missing
+        const after = loadWhiteflags().filter((x) => x.id !== entry.id);
+        saveWhiteflags(after);
+        return safeReply(interaction, { content: "❌ Review channel missing. Ask staff to run /setup.", ephemeral: true });
       }
 
       await sendModLog(
         guild,
-        `✅ Whiteflag started: **${tribe}** (${tier}) by <@${interaction.user.id}> for ${hours}h`
+        `📝 Whiteflag requested: **${tribe}** (${tier}) by <@${interaction.user.id}> — Pending staff review.`
       );
 
-      return safeReply(interaction, {
-        content: `✅ Whiteflag started for **${tribe}** (${tier}) for **${hours}h**.`,
-        ephemeral: true,
-      });
+      return safeReply(interaction, { content: "✅ Request submitted! Staff will review it.", ephemeral: true });
     }
 
-    // ---------- BUTTON ----------
+    // ===================== USER BUTTONS (OPEN MODAL) =====================
     if (interaction.isButton()) {
       const guild = interaction.guild;
-      if (!guild) {
-        return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-      }
+      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
 
-      // Restrict button usage to configured open-season channel (if set)
       const s = getGuildSettings(guild.id);
       if (s.openSeasonChannelId && interaction.channelId !== s.openSeasonChannelId) {
-        return safeReply(interaction, {
-          content: "❌ Please use this in the open-season channel.",
-          ephemeral: true,
-        });
+        return safeReply(interaction, { content: "❌ Please use this in the open-season channel.", ephemeral: true });
       }
 
-      if (interaction.customId === BTN_100X) return interaction.showModal(buildWhiteflagModal("100x"));
-      if (interaction.customId === BTN_25X) return interaction.showModal(buildWhiteflagModal("25x"));
+      if (interaction.customId === BTN_100X) return interaction.showModal(buildUserRequestModal("100x"));
+      if (interaction.customId === BTN_25X) return interaction.showModal(buildUserRequestModal("25x"));
       return;
     }
 
-    // ---------- SLASH COMMAND ----------
+    // ===================== SLASH COMMANDS =====================
     if (!interaction.isChatInputCommand()) return;
 
     const guild = interaction.guild;
-    if (!guild) {
-      return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-    }
+    if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
 
     const cmd = interaction.commandName;
     const isAdmin = isAdminMember(interaction.member);
 
-    // ---- /setup ----
     if (cmd === "setup") {
       if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
       const openSeasonChannel = interaction.options.getChannel("open_season_channel", true);
+      const reviewChannel = interaction.options.getChannel("review_channel", true);
       const modLogChannel = interaction.options.getChannel("mod_log_channel", true);
+
+      if (openSeasonChannel.type !== ChannelType.GuildText) {
+        return safeReply(interaction, { content: "❌ Open season must be a text channel.", ephemeral: true });
+      }
+      if (reviewChannel.type !== ChannelType.GuildText) {
+        return safeReply(interaction, { content: "❌ Review must be a text channel.", ephemeral: true });
+      }
+      if (modLogChannel.type !== ChannelType.GuildText) {
+        return safeReply(interaction, { content: "❌ Mod log must be a text channel.", ephemeral: true });
+      }
 
       setGuildSettings(guild.id, {
         openSeasonChannelId: openSeasonChannel.id,
+        reviewChannelId: reviewChannel.id,
         modLogChannelId: modLogChannel.id,
       });
 
       return safeReply(interaction, {
-        content: `✅ Setup complete.\n- Open season: <#${openSeasonChannel.id}>\n- Mod log: <#${modLogChannel.id}>`,
+        content:
+          `✅ Setup complete.\n` +
+          `- Open season: <#${openSeasonChannel.id}> (ONLY early-expire announcements)\n` +
+          `- Review: <#${reviewChannel.id}>\n` +
+          `- Mod log: <#${modLogChannel.id}>`,
         ephemeral: true,
       });
     }
 
-    // ---- /setup_roles ----
     if (cmd === "setup_roles") {
       if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
@@ -317,86 +551,82 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // ---- /post_whiteflag_buttons ----
     if (cmd === "post_whiteflag_buttons") {
       if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
       const s = getGuildSettings(guild.id);
-      if (!s.openSeasonChannelId) {
-        return safeReply(interaction, {
-          content: "❌ Run /setup first (open season channel not set).",
-          ephemeral: true,
-        });
-      }
+      if (!s.openSeasonChannelId) return safeReply(interaction, { content: "❌ Run /setup first.", ephemeral: true });
 
       const ch = await guild.channels.fetch(s.openSeasonChannelId).catch(() => null);
-      if (!ch) {
-        return safeReply(interaction, { content: "❌ Open season channel missing.", ephemeral: true });
-      }
+      if (!ch) return safeReply(interaction, { content: "❌ Open season channel missing.", ephemeral: true });
 
       await ch.send({
-        content: "Select a tier to submit a whiteflag request:",
+        content: "Select a tier to submit a whiteflag request (staff approval required):",
         components: [buildFormButtons()],
       });
 
       return safeReply(interaction, { content: "✅ Buttons posted.", ephemeral: true });
     }
 
-    // ---- /rules ----
     if (cmd === "rules") {
       const rulesText =
         "**🏳️ White Flag Rules**\n" +
         "• Do not raid tribes with an active white flag.\n" +
-        "• White flag applies for the approved duration.\n" +
+        "• White flag lasts **7 days** once approved.\n" +
         "• Any abuse may result in removal and punishment.\n" +
         "• Staff decision is final.\n";
 
-      const channel = interaction.channel;
-      if (!channel) {
-        return safeReply(interaction, { content: "❌ Can't find a channel.", ephemeral: true });
-      }
-
-      await channel.send({ content: rulesText });
+      await interaction.channel?.send({ content: rulesText }).catch(() => null);
       return safeReply(interaction, { content: "✅ Rules posted.", ephemeral: true });
     }
 
-    // ---- /whiteflag_list ----
     if (cmd === "whiteflag_list") {
       if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
-      let items = pruneExpired(loadWhiteflags()).filter((x) => x.guildId === guild.id);
-      if (!items.length) return safeReply(interaction, { content: "No active whiteflags.", ephemeral: true });
+      const { kept } = pruneExpiredWithReport(loadWhiteflags());
+      const pending = kept.filter((x) => x.guildId === guild.id && x.status === "pending");
+      const active = kept.filter((x) => x.guildId === guild.id && x.status === "active");
 
-      const lines = items
-        .sort((a, b) => a.expiresAt - b.expiresAt)
-        .map((x) => {
-          const exp = x.expiresAt ? `<t:${Math.floor(x.expiresAt / 1000)}:R>` : "N/A";
-          return `• **${x.tribe}** (${x.tier}) expires ${exp}`;
-        });
+      if (!pending.length && !active.length) {
+        return safeReply(interaction, { content: "No pending or active whiteflags.", ephemeral: true });
+      }
 
-      return safeReply(interaction, {
-        content: `**Active whiteflags:**\n${lines.join("\n")}`,
-        ephemeral: true,
-      });
+      const lines = [];
+      if (pending.length) {
+        lines.push("**Pending:**");
+        for (const x of pending.sort((a, b) => a.requestedAt - b.requestedAt)) {
+          lines.push(`• **${x.tribe}** (${x.tier}) — IGN: ${x.ign} — Map: ${x.map}`);
+        }
+      }
+      if (active.length) {
+        lines.push("", "**Active:**");
+        for (const x of active.sort((a, b) => a.expiresAt - b.expiresAt)) {
+          lines.push(`• **${x.tribe}** (${x.tier}) expires <t:${Math.floor(x.expiresAt / 1000)}:R>`);
+        }
+      }
+
+      return safeReply(interaction, { content: lines.join("\n"), ephemeral: true });
     }
 
-    // ---- /whiteflag_end ----
+    // ✅ ONLY open-season announcement happens here
     if (cmd === "whiteflag_end") {
       if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
       const tribeInput = interaction.options.getString("tribe", true);
       const reason = interaction.options.getString("reason") || "No reason provided";
 
-      let items = pruneExpired(loadWhiteflags());
+      const { kept } = pruneExpiredWithReport(loadWhiteflags());
+      let items = kept;
+
       const idx = items.findIndex(
-        (x) => x.guildId === guild.id && x.tribe.toLowerCase() === tribeInput.toLowerCase()
+        (x) =>
+          x.guildId === guild.id &&
+          x.status === "active" &&
+          x.tribe.toLowerCase() === tribeInput.toLowerCase()
       );
 
       if (idx === -1) {
-        return safeReply(interaction, {
-          content: "❌ No active whiteflag found for that tribe.",
-          ephemeral: true,
-        });
+        return safeReply(interaction, { content: "❌ No active whiteflag found for that tribe.", ephemeral: true });
       }
 
       const ended = items[idx];
@@ -405,16 +635,31 @@ client.on("interactionCreate", async (interaction) => {
 
       await sendModLog(
         guild,
-        `🛑 Whiteflag ended: **${ended.tribe}** (${ended.tier}) by <@${interaction.user.id}> — Reason: ${reason}`
+        `🛑 Whiteflag ended early: **${ended.tribe}** (${ended.tier}) by <@${interaction.user.id}> — Reason: ${reason}`
       );
 
-      return safeReply(interaction, {
-        content: `✅ Ended whiteflag for **${ended.tribe}** (${ended.tier}).`,
-        ephemeral: true,
+      await sendOpenSeason(guild, {
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("🛑 Whiteflag Ended Early")
+            .addFields(
+              { name: "Tribe", value: ended.tribe, inline: true },
+              { name: "Tier", value: ended.tier, inline: true },
+              { name: "Reason", value: reason, inline: false }
+            ),
+        ],
       });
+
+      await tryDM(client, ended.requestedBy, {
+        content:
+          `🛑 Your active whiteflag was ended early in **${guild.name}**.\n` +
+          `Tribe: **${ended.tribe}** (${ended.tier})\nReason: ${reason}`,
+      });
+
+      return safeReply(interaction, { content: `✅ Ended whiteflag for **${ended.tribe}**.`, ephemeral: true });
     }
 
-    // ---- /ping100x and /ping25x ----
+    // Optional pings
     if (cmd === "ping100x" || cmd === "ping25x") {
       if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
 
@@ -422,29 +667,17 @@ client.on("interactionCreate", async (interaction) => {
       const roleId = cmd === "ping100x" ? s.role100xId : s.role25xId;
       const tierName = cmd === "ping100x" ? "100x" : "25x";
 
-      if (!roleId) {
-        return safeReply(interaction, { content: "❌ Run /setup_roles first.", ephemeral: true });
-      }
+      if (!roleId) return safeReply(interaction, { content: "❌ Run /setup_roles first.", ephemeral: true });
 
       const msg = interaction.options.getString("message") || `Ping for ${tierName}`;
-
-      const channel = interaction.channel;
-      if (!channel) {
-        return safeReply(interaction, {
-          content: "❌ Can't find a channel to send the ping.",
-          ephemeral: true,
-        });
-      }
-
-      await channel.send({
+      await interaction.channel?.send({
         content: `<@&${roleId}> ${msg}`,
         allowedMentions: { parse: ["roles"] },
-      });
+      }).catch(() => null);
 
       return safeReply(interaction, { content: "✅ Ping sent.", ephemeral: true });
     }
 
-    // fallback
     return safeReply(interaction, { content: "❓ Unknown command.", ephemeral: true });
   } catch (err) {
     console.error("interactionCreate error:", err);
@@ -455,9 +688,9 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // -------------------- login --------------------
-const token = process.env.TOKEN;
+const token = process.env.DISCORD_TOKEN;
 if (!token) {
-  console.error("❌ Missing TOKEN in .env");
+  console.error("❌ Missing DISCORD_TOKEN in env.");
   process.exit(1);
 }
 client.login(token);
