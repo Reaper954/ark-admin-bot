@@ -629,7 +629,7 @@ bot.on("interactionCreate", async (interaction) => {
         const lines = active.map((r) => {
           const endsAt = r.approvedAt + SEVEN_DAYS_MS;
           const server = escapeMd(r.serverType || r.cluster || "N/A");
-          return `• **${escapeMd(r.tribeName)}** — IGN: **${escapeMd(r.ign)}** — Server: **${server}** — Ends ${fmtDiscordRelativeTime(endsAt)} (ID: \\`${r.id}\\`)`;
+          return `• **${escapeMd(r.tribeName)}** — IGN: **${escapeMd(r.ign)}** — Server: **${server}** — Ends ${fmtDiscordRelativeTime(endsAt)} (ID: \`${r.id}\`)`;
         });
 
         const embed = new EmbedBuilder()
@@ -802,7 +802,7 @@ bot.on("interactionCreate", async (interaction) => {
             return interaction.reply({
               content:
                 `❌ Cannot approve. Tribe **${escapeMd(req.tribeName)}** already has an active White Flag ` +
-                `(ID: \\`${existingActive.id}\\`) ending ${fmtDiscordRelativeTime(existingActive.approvedAt + SEVEN_DAYS_MS)}.`,
+                `(ID: \`${existingActive.id}\`) ending ${fmtDiscordRelativeTime(existingActive.approvedAt + SEVEN_DAYS_MS)}.`,
               ephemeral: true,
             });
           }
@@ -1009,7 +1009,7 @@ bot.on("interactionCreate", async (interaction) => {
       if (existingActive) {
         return interaction.reply({
           content:
-            `❌ That tribe already has an active White Flag (ID: \\`${existingActive.id}\\`) ` +
+            `❌ That tribe already has an active White Flag (ID: \`${existingActive.id}\`) ` +
             `ending ${fmtDiscordRelativeTime(existingActive.approvedAt + SEVEN_DAYS_MS)}.`,
           ephemeral: true,
         });
