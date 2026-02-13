@@ -1,696 +1,771 @@
-require("dotenv").config();
+// index.js
+// Production-ready Discord.js v14 bot for White Flag system using JSON storage.
+// Features:
+// - /setup posts rules + apply panel (button-based modal form)
+// - Rules must be accepted before form can submit (role gate)
+// - On submit: pings admin role in admin channel with Approve/Deny buttons
+// - Approve: starts 7-day timer (no Open Season ping on expiry)
+// - Admin can end early via button -> cancels timer + pings Open Season role in announce channel
+// - /rules shows rules
+//
+// Requirements: discord.js v14, Node 18+
+// Env: DISCORD_TOKEN
+// Optional: DATA_DIR (defaults ./data)
+//
+// Install: npm i discord.js dotenv
+// Run: node index.js
 
+require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   PermissionsBitField,
+  EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  EmbedBuilder,
+  InteractionType,
   ChannelType,
 } = require("discord.js");
 
-// ==================== CONFIG ====================
-const FIXED_DURATION_HOURS = 168; // 7 days
-const SETTINGS_FILE = path.join(__dirname, "settings.json");
-const WHITEFLAGS_FILE = path.join(__dirname, "whiteflags.json");
+const TOKEN = process.env.DISCORD_TOKEN;
+if (!TOKEN) {
+  console.error("Missing DISCORD_TOKEN in environment.");
+  process.exit(1);
+}
 
-// Custom IDs
-const BTN_100X = "whiteflag_btn:100x";
-const BTN_25X = "whiteflag_btn:25x";
-const USER_MODAL_PREFIX = "whiteflag_modal:"; // whiteflag_modal:100x | whiteflag_modal:25x
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const STATE_PATH = path.join(DATA_DIR, "state.json");
+const REQUESTS_PATH = path.join(DATA_DIR, "requests.json");
 
-const REVIEW_PREFIX = "wf_review:"; // wf_review:approve:<id> | wf_review:deny:<id>
-const STAFF_APPROVE_MODAL_PREFIX = "wf_staff_approve:"; // wf_staff_approve:<id>
+// Ensure data dir exists
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// -------------------- crash protection --------------------
-process.on("unhandledRejection", (err) => console.error("UnhandledRejection:", err));
-process.on("uncaughtException", (err) => console.error("UncaughtException:", err));
-
-// ==================== JSON helpers ====================
-function readJsonSafe(filePath, fallback) {
+// ---- Simple JSON store helpers (atomic-ish writes) ----
+function readJson(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
     const raw = fs.readFileSync(filePath, "utf8");
-    if (!raw.trim()) return fallback;
     return JSON.parse(raw);
-  } catch (e) {
-    console.error(`Failed reading JSON: ${filePath}`, e);
+  } catch {
     return fallback;
   }
 }
-function writeJsonSafe(filePath, data) {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
-  } catch (e) {
-    console.error(`Failed writing JSON: ${filePath}`, e);
-  }
+
+function writeJson(filePath, obj) {
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
+  fs.renameSync(tmp, filePath);
 }
 
-// ==================== Settings (per guild) ====================
-function loadSettings() {
-  return readJsonSafe(SETTINGS_FILE, {});
-}
-function saveSettings(all) {
-  writeJsonSafe(SETTINGS_FILE, all);
-}
-function getGuildSettings(guildId) {
-  const all = loadSettings();
-  return all[guildId] || {};
-}
-function setGuildSettings(guildId, patch) {
-  const all = loadSettings();
-  all[guildId] = { ...(all[guildId] || {}), ...patch };
-  saveSettings(all);
-}
-function assertSetup(guildId) {
-  const s = getGuildSettings(guildId);
-  const missing = [];
-  if (!s.openSeasonChannelId) missing.push("open season channel");
-  if (!s.reviewChannelId) missing.push("review channel");
-  if (!s.modLogChannelId) missing.push("mod log channel");
-  // roles are optional now since duration fixed; keep if you still want /ping commands
-  // if (!s.role100xId) missing.push("100x role");
-  // if (!s.role25xId) missing.push("25x role");
-  return { ok: missing.length === 0, missing, s };
-}
+// ---- Global persisted config ----
+/**
+ * state = {
+ *   guildId: string,
+ *   rulesChannelId: string,
+ *   applyChannelId: string,
+ *   adminChannelId: string,
+ *   announceChannelId: string,
+ *   adminRoleId: string,
+ *   openSeasonRoleId: string,
+ *   rulesAcceptedRoleId: string, // must exist
+ *   rulesMessageId: string,
+ *   applyMessageId: string
+ * }
+ */
+let state = readJson(STATE_PATH, {
+  guildId: null,
+  rulesChannelId: null,
+  applyChannelId: null,
+  adminChannelId: null,
+  announceChannelId: null,
+  adminRoleId: null,
+  openSeasonRoleId: null,
+  rulesAcceptedRoleId: null,
+  rulesMessageId: null,
+  applyMessageId: null,
+});
 
-// ==================== Whiteflags (JSON array) ====================
-function loadWhiteflags() {
-  return readJsonSafe(WHITEFLAGS_FILE, []);
-}
-function saveWhiteflags(items) {
-  writeJsonSafe(WHITEFLAGS_FILE, items);
-}
-function makeId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-function normalizeTier(tier) {
-  return tier === "100x" ? "100x" : "25x";
-}
-function pruneExpiredWithReport(items) {
-  const now = Date.now();
-  const expired = [];
-  const kept = [];
+// requests = { [requestId]: { ... } }
+let requests = readJson(REQUESTS_PATH, {});
 
-  for (const x of items) {
-    if (x.status === "active" && x.expiresAt && x.expiresAt <= now) expired.push(x);
-    else kept.push(x);
-  }
+// Active timers in memory: requestId -> timeout
+const activeTimeouts = new Map();
 
-  if (kept.length !== items.length) saveWhiteflags(kept);
-  return { kept, expired };
-}
+// ---- Constants for custom IDs ----
+const CID = {
+  RULES_ACCEPT: "wf_rules_accept",
+  APPLY_OPEN: "wf_apply_open",
+  APPLY_MODAL: "wf_apply_modal",
+  ADMIN_APPROVE_PREFIX: "wf_admin_approve:", // + requestId
+  ADMIN_DENY_PREFIX: "wf_admin_deny:", // + requestId
+  ADMIN_END_EARLY_PREFIX: "wf_admin_end:", // + requestId
+};
 
-// ==================== Helpers ====================
-function isAdminMember(member) {
-  return member?.permissions?.has(PermissionsBitField.Flags.Administrator);
-}
+// 7 days in ms
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-async function safeReply(interaction, payload) {
-  const already = interaction.deferred || interaction.replied;
-  if (already) return interaction.followUp(payload).catch(() => null);
-  return interaction.reply(payload).catch(() => null);
-}
-
-async function sendToChannelId(guild, channelId, payload) {
-  if (!channelId) return null;
-  const ch = await guild.channels.fetch(channelId).catch(() => null);
-  if (!ch) return null;
-  return ch.send(payload).catch(() => null);
-}
-
-async function sendModLog(guild, text) {
-  const s = getGuildSettings(guild.id);
-  return sendToChannelId(guild, s.modLogChannelId, { content: text });
-}
-
-async function sendOpenSeason(guild, payload) {
-  const s = getGuildSettings(guild.id);
-  return sendToChannelId(guild, s.openSeasonChannelId, payload);
-}
-
-async function sendReview(guild, payload) {
-  const s = getGuildSettings(guild.id);
-  return sendToChannelId(guild, s.reviewChannelId, payload);
-}
-
-async function tryDM(client, userId, payload) {
-  try {
-    const user = await client.users.fetch(userId).catch(() => null);
-    if (!user) return false;
-    await user.send(payload).catch(() => null);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// ==================== UI builders ====================
-function buildFormButtons() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(BTN_100X).setLabel("100x").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(BTN_25X).setLabel("25x").setStyle(ButtonStyle.Primary)
-  );
-}
-
-// USER REQUEST MODAL (your requested fields)
-function buildUserRequestModal(tier) {
-  const modal = new ModalBuilder()
-    .setCustomId(`${USER_MODAL_PREFIX}${tier}`)
-    .setTitle(`Whiteflag Request (${tier})`);
-
-  const ign = new TextInputBuilder()
-    .setCustomId("ign")
-    .setLabel("IGN")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMinLength(2)
-    .setMaxLength(32)
-    .setPlaceholder("Example: Cookm");
-
-  const tribe = new TextInputBuilder()
-    .setCustomId("tribe")
-    .setLabel("Tribe")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMinLength(2)
-    .setMaxLength(40)
-    .setPlaceholder("Example: The Bloodhounds");
-
-  const map = new TextInputBuilder()
-    .setCustomId("map")
-    .setLabel("Map")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMinLength(2)
-    .setMaxLength(40)
-    .setPlaceholder("Example: The Island / Fjordur / Center");
-
-  const tribemates = new TextInputBuilder()
-    .setCustomId("tribemates")
-    .setLabel("Tribemates (optional)")
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setMaxLength(300)
-    .setPlaceholder("Example: Player1, Player2, Player3");
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(ign),
-    new ActionRowBuilder().addComponents(tribe),
-    new ActionRowBuilder().addComponents(map),
-    new ActionRowBuilder().addComponents(tribemates)
-  );
-
-  return modal;
-}
-
-function buildReviewButtons(requestId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`${REVIEW_PREFIX}approve:${requestId}`)
-      .setLabel("Approve (7 days)")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`${REVIEW_PREFIX}deny:${requestId}`)
-      .setLabel("Deny")
-      .setStyle(ButtonStyle.Danger)
-  );
-}
-
-// Optional staff note modal (NO duration input)
-function buildStaffApproveModal(requestId, entry) {
-  const modal = new ModalBuilder()
-    .setCustomId(`${STAFF_APPROVE_MODAL_PREFIX}${requestId}`)
-    .setTitle(`Approve: ${entry.tribe} (${entry.tier})`);
-
-  const staffNote = new TextInputBuilder()
-    .setCustomId("staff_note")
-    .setLabel("Staff note (optional)")
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setMaxLength(300)
-    .setPlaceholder("Optional note for logs/DM");
-
-  modal.addComponents(new ActionRowBuilder().addComponents(staffNote));
-  return modal;
-}
-
-function buildReviewEmbed(entry) {
-  const embed = new EmbedBuilder()
-    .setTitle("📝 Whiteflag Request (Pending Staff Review)")
-    .addFields(
-      { name: "Tier", value: `**${entry.tier}**`, inline: true },
-      { name: "IGN", value: `**${entry.ign}**`, inline: true },
-      { name: "Tribe", value: `**${entry.tribe}**`, inline: true },
-      { name: "Map", value: entry.map, inline: true },
-      { name: "Requested By", value: `<@${entry.requestedBy}>`, inline: true },
-      { name: "Request ID", value: `\`${entry.id}\``, inline: false }
+// ---- Rules embed content ----
+function buildRulesEmbed() {
+  return new EmbedBuilder()
+    .setTitle("📜 White Flag Rules & Agreement")
+    .setDescription(
+      [
+        "The White Flag system is designed to give new tribes a fair start and time to build. Abuse of this system will result in removal and a bounty placed on your tribe’s head.",
+        "",
+        "**Eligibility & Duration**",
+        "• White Flag is intended for **new tribes only**.",
+        "• Protection lasts **7 days from approval**.",
+        "• Admins will remove the White Flag early if rules are broken.",
+        "",
+        "**While White Flag is Active**",
+        "• **YOU CAN NOT RAID OTHER TRIBES.**",
+        "• Build, farm, tame, and establish your base.",
+        "• You can do PvP in the open as long as you are not raiding their base or scouting a base.",
+        "",
+        "**Protections Granted**",
+        "• Your tribe should not be raided while White Flag is active.",
+        "• Harassment or targeting White Flag tribes is not allowed.",
+        "",
+        "**Violations**",
+        "• Raiding while under White Flag = **immediate removal**.",
+        "• Abuse of protection (scouting for raids, feeding intel, etc.) = **removal**.",
+        "• Admin discretion may apply additional penalties.",
+        "• If you break the rules, your flag will be removed, your tribe will be announced as **OPEN SEASON**, and a bounty may be placed.",
+        "",
+        "**After Expiration**",
+        "Once your White Flag expires your tribe is fully open to normal PvP rules.",
+      ].join("\n")
     );
-
-  if (entry.tribemates) embed.addFields({ name: "Tribemates", value: entry.tribemates, inline: false });
-
-  return embed;
 }
 
-// ==================== Discord client ====================
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+function buildRulesRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(CID.RULES_ACCEPT)
+      .setLabel("✅ I Agree & Understand")
+      .setStyle(ButtonStyle.Success)
+  );
+}
 
-// v14 uses "ready"; v15 uses "clientReady" (safe to listen to both)
-let ranReady = false;
-function onReady() {
-  if (ranReady) return;
-  ranReady = true;
+function buildApplyEmbed() {
+  return new EmbedBuilder()
+    .setTitle("🏳️ White Flag Application")
+    .setDescription(
+      [
+        "Before applying, you must read and accept the rules.",
+        "",
+        "Click **Apply for White Flag** to submit your request (IGN, Tribe, Cluster, Map).",
+      ].join("\n")
+    );
+}
 
-  console.log(`✅ Logged in as ${client.user.tag}`);
+function buildApplyRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(CID.APPLY_OPEN)
+      .setLabel("🏳️ Apply for White Flag")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
 
-  // Auto-expire loop: log + DM only (NO open-season announcements)
-  setInterval(async () => {
+function isTextChannel(ch) {
+  return (
+    ch &&
+    (ch.type === ChannelType.GuildText ||
+      ch.type === ChannelType.GuildAnnouncement ||
+      ch.type === ChannelType.PublicThread ||
+      ch.type === ChannelType.PrivateThread)
+  );
+}
+
+// ---- Request lifecycle helpers ----
+function newRequestId() {
+  // short-ish unique id
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function persist() {
+  writeJson(STATE_PATH, state);
+  writeJson(REQUESTS_PATH, requests);
+}
+
+function scheduleExpiry(requestId) {
+  const req = requests[requestId];
+  if (!req || req.status !== "approved" || !req.approvedAt) return;
+
+  // Clear existing
+  const existing = activeTimeouts.get(requestId);
+  if (existing) clearTimeout(existing);
+
+  const now = Date.now();
+  const endsAt = req.approvedAt + SEVEN_DAYS_MS;
+  const delay = Math.max(0, endsAt - now);
+
+  const t = setTimeout(async () => {
     try {
-      const all = loadWhiteflags();
-      const { expired } = pruneExpiredWithReport(all);
-      if (!expired.length) return;
+      // Re-read latest in case of changes
+      requests = readJson(REQUESTS_PATH, {});
+      const r = requests[requestId];
+      if (!r) return;
+      if (r.status !== "approved") return; // denied/ended already
 
-      const byGuild = new Map();
-      for (const e of expired) {
-        if (!byGuild.has(e.guildId)) byGuild.set(e.guildId, []);
-        byGuild.get(e.guildId).push(e);
+      r.status = "expired";
+      r.expiredAt = Date.now();
+      requests[requestId] = r;
+      persist();
+
+      // Post expiry message in admin channel (no role ping)
+      const client = bot;
+      const guild = await client.guilds.fetch(state.guildId).catch(() => null);
+      if (!guild) return;
+      const adminCh = await guild.channels.fetch(state.adminChannelId).catch(() => null);
+      if (adminCh && isTextChannel(adminCh)) {
+        await adminCh.send(
+          `⏳ White Flag expired for **${escapeMd(r.tribeName)}** (IGN: **${escapeMd(
+            r.ign
+          )}**).`
+        );
       }
+    } finally {
+      activeTimeouts.delete(requestId);
+    }
+  }, delay);
 
-      for (const [guildId, entries] of byGuild) {
-        const guild = await client.guilds.fetch(guildId).catch(() => null);
-        if (!guild) continue;
+  activeTimeouts.set(requestId, t);
+}
 
-        for (const e of entries) {
-          await sendModLog(
-            guild,
-            `⏱️ Whiteflag expired: **${e.tribe}** (${e.tier}) (requested by <@${e.requestedBy}>)`
-          );
+function escapeMd(str) {
+  if (!str) return "";
+  return String(str).replace(/([*_`~|>])/g, "\\$1");
+}
 
-          await tryDM(client, e.requestedBy, {
-            content: `⏱️ Your whiteflag expired in **${guild.name}**.\nTribe: **${e.tribe}** (${e.tier})`,
+async function ensureRulesAcceptedRole(guild) {
+  // If state already has role id and it exists, use it
+  if (state.rulesAcceptedRoleId) {
+    const existing = await guild.roles.fetch(state.rulesAcceptedRoleId).catch(() => null);
+    if (existing) return existing;
+    state.rulesAcceptedRoleId = null;
+  }
+
+  // Try find by name
+  const found = guild.roles.cache.find((r) => r.name.toLowerCase() === "rules accepted");
+  if (found) {
+    state.rulesAcceptedRoleId = found.id;
+    persist();
+    return found;
+  }
+
+  // Create role
+  const created = await guild.roles.create({
+    name: "Rules Accepted",
+    mentionable: false,
+    reason: "White Flag bot: role gate for rules acceptance",
+  });
+  state.rulesAcceptedRoleId = created.id;
+  persist();
+  return created;
+}
+
+// ---- Discord client ----
+const bot = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  partials: [Partials.GuildMember],
+});
+
+bot.once("ready", async () => {
+  console.log(`✅ Logged in as ${bot.user.tag}`);
+
+  // Re-schedule timers after restart
+  try {
+    requests = readJson(REQUESTS_PATH, {});
+    const now = Date.now();
+    for (const [id, r] of Object.entries(requests)) {
+      if (r.status === "approved" && r.approvedAt && r.approvedAt + SEVEN_DAYS_MS > now) {
+        scheduleExpiry(id);
+      }
+    }
+  } catch (e) {
+    console.error("Failed to reschedule timers:", e);
+  }
+});
+
+bot.on("interactionCreate", async (interaction) => {
+  try {
+    // --- Slash commands ---
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "setup") {
+        // Admin check (server perms)
+        if (
+          !interaction.memberPermissions ||
+          !interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)
+        ) {
+          return interaction.reply({ content: "Admins only.", ephemeral: true });
+        }
+
+        const guild = interaction.guild;
+        if (!guild) return interaction.reply({ content: "Guild only.", ephemeral: true });
+
+        // Resolve options
+        const rulesChannel = interaction.options.getChannel("rules_channel");
+        const applyChannel = interaction.options.getChannel("apply_channel");
+        const adminChannel = interaction.options.getChannel("admin_channel");
+        const announceChannel = interaction.options.getChannel("announce_channel");
+        const adminRole = interaction.options.getRole("admin_role");
+        const openSeasonRole = interaction.options.getRole("open_season_role");
+
+        if (![rulesChannel, applyChannel, adminChannel, announceChannel].every(isTextChannel)) {
+          return interaction.reply({
+            content: "All channels must be text channels.",
+            ephemeral: true,
           });
         }
-      }
-    } catch (err) {
-      console.error("auto-expire loop error:", err);
-    }
-  }, 60_000);
-}
-client.once("ready", onReady);
-client.once("clientReady", onReady);
 
-client.on("interactionCreate", async (interaction) => {
-  try {
-    // ===================== STAFF APPROVE MODAL SUBMIT =====================
-    if (interaction.isModalSubmit() && interaction.customId.startsWith(STAFF_APPROVE_MODAL_PREFIX)) {
-      const guild = interaction.guild;
-      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-      if (!isAdminMember(interaction.member)) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
+        // Ensure role for rules gate exists
+        const rulesAcceptedRole = await ensureRulesAcceptedRole(guild);
 
-      const requestId = interaction.customId.replace(STAFF_APPROVE_MODAL_PREFIX, "").trim();
-      const staffNote = (interaction.fields.getTextInputValue("staff_note") || "").trim();
+        // Persist config
+        state.guildId = guild.id;
+        state.rulesChannelId = rulesChannel.id;
+        state.applyChannelId = applyChannel.id;
+        state.adminChannelId = adminChannel.id;
+        state.announceChannelId = announceChannel.id;
+        state.adminRoleId = adminRole.id;
+        state.openSeasonRoleId = openSeasonRole.id;
+        state.rulesAcceptedRoleId = rulesAcceptedRole.id;
 
-      const { ok, missing } = assertSetup(guild.id);
-      if (!ok) return safeReply(interaction, { content: `❌ Missing setup: ${missing.join(", ")}`, ephemeral: true });
-
-      // prune expired before actions
-      const { kept } = pruneExpiredWithReport(loadWhiteflags());
-      let items = kept;
-
-      const idx = items.findIndex((x) => x.guildId === guild.id && x.id === requestId);
-      if (idx === -1) return safeReply(interaction, { content: "❌ Request not found.", ephemeral: true });
-
-      const entry = items[idx];
-      if (entry.status !== "pending") return safeReply(interaction, { content: `❌ Request already **${entry.status}**.`, ephemeral: true });
-
-      // Approve fixed duration
-      entry.status = "active";
-      entry.durationHours = FIXED_DURATION_HOURS;
-      entry.approvedBy = interaction.user.id;
-      entry.approvedAt = Date.now();
-      entry.expiresAt = Date.now() + FIXED_DURATION_HOURS * 60 * 60 * 1000;
-      if (staffNote) entry.staffNote = staffNote;
-
-      items[idx] = entry;
-      saveWhiteflags(items);
-
-      // disable review buttons on the review message
-      await interaction.message?.edit({ components: [] }).catch(() => null);
-
-      await sendModLog(
-        guild,
-        `✅ Whiteflag approved: **${entry.tribe}** (${entry.tier}) by <@${interaction.user.id}> — Duration: 7 days — Expires <t:${Math.floor(entry.expiresAt / 1000)}:R>` +
-          (staffNote ? ` — Note: ${staffNote}` : "")
-      );
-
-      await tryDM(client, entry.requestedBy, {
-        content:
-          `✅ Your whiteflag was approved in **${guild.name}**.\n` +
-          `Tribe: **${entry.tribe}** (${entry.tier})\n` +
-          `Duration: **7 days**\n` +
-          `Expires: <t:${Math.floor(entry.expiresAt / 1000)}:R>` +
-          (staffNote ? `\nStaff note: ${staffNote}` : ""),
-      });
-
-      return safeReply(interaction, { content: "✅ Approved for 7 days.", ephemeral: true });
-    }
-
-    // ===================== REVIEW BUTTONS =====================
-    if (interaction.isButton() && interaction.customId.startsWith(REVIEW_PREFIX)) {
-      const guild = interaction.guild;
-      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-      if (!isAdminMember(interaction.member)) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const [, action, requestId] = interaction.customId.split(":");
-      if (!action || !requestId) return safeReply(interaction, { content: "❌ Invalid action.", ephemeral: true });
-
-      const { ok, missing } = assertSetup(guild.id);
-      if (!ok) return safeReply(interaction, { content: `❌ Missing setup: ${missing.join(", ")}`, ephemeral: true });
-
-      const { kept } = pruneExpiredWithReport(loadWhiteflags());
-      let items = kept;
-
-      const idx = items.findIndex((x) => x.guildId === guild.id && x.id === requestId);
-      if (idx === -1) return safeReply(interaction, { content: "❌ Request not found.", ephemeral: true });
-
-      const entry = items[idx];
-      if (entry.status !== "pending") return safeReply(interaction, { content: `❌ Request already **${entry.status}**.`, ephemeral: true });
-
-      if (action === "deny") {
-        items.splice(idx, 1);
-        saveWhiteflags(items);
-
-        await interaction.message?.edit({ components: [] }).catch(() => null);
-
-        await sendModLog(
-          guild,
-          `❌ Whiteflag denied: **${entry.tribe}** (${entry.tier}) by <@${interaction.user.id}> (requested by <@${entry.requestedBy}>)`
-        );
-
-        await tryDM(client, entry.requestedBy, {
-          content:
-            `❌ Your whiteflag request was denied in **${guild.name}**.\n` +
-            `Tribe: **${entry.tribe}** (${entry.tier})`,
+        // Post / replace panels
+        const rulesMsg = await rulesChannel.send({
+          embeds: [buildRulesEmbed()],
+          components: [buildRulesRow()],
         });
 
-        return safeReply(interaction, { content: "✅ Denied.", ephemeral: true });
+        const applyMsg = await applyChannel.send({
+          embeds: [buildApplyEmbed()],
+          components: [buildApplyRow()],
+        });
+
+        state.rulesMessageId = rulesMsg.id;
+        state.applyMessageId = applyMsg.id;
+        persist();
+
+        return interaction.reply({
+          content:
+            `✅ Setup complete.\n` +
+            `• Rules panel: <#${rulesChannel.id}>\n` +
+            `• Apply panel: <#${applyChannel.id}>\n` +
+            `• Admin review: <#${adminChannel.id}> (ping <@&${adminRole.id}>)\n` +
+            `• Open Season announcements: <#${announceChannel.id}> (ping <@&${openSeasonRole.id}>)\n` +
+            `• Rules gate role: <@&${rulesAcceptedRole.id}>`,
+          ephemeral: true,
+        });
       }
 
-      if (action === "approve") {
-        // open staff note modal (duration fixed, so no hours asked)
-        return interaction.showModal(buildStaffApproveModal(requestId, entry));
+      if (interaction.commandName === "rules") {
+        return interaction.reply({
+          embeds: [buildRulesEmbed()],
+          components: [buildRulesRow()],
+          ephemeral: true,
+        });
       }
-
-      return safeReply(interaction, { content: "❌ Unknown action.", ephemeral: true });
     }
 
-    // ===================== USER MODAL SUBMIT (REQUEST) =====================
-    if (interaction.isModalSubmit() && interaction.customId.startsWith(USER_MODAL_PREFIX)) {
-      const guild = interaction.guild;
-      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
+    // --- Buttons ---
+    if (interaction.isButton()) {
+      // Rules accept
+      if (interaction.customId === CID.RULES_ACCEPT) {
+        if (!interaction.guild || !interaction.member) {
+          return interaction.reply({ content: "Guild only.", ephemeral: true });
+        }
+        if (!state.rulesAcceptedRoleId) {
+          return interaction.reply({
+            content: "Bot not setup yet. Ask an admin to run /setup.",
+            ephemeral: true,
+          });
+        }
+        const role = await interaction.guild.roles
+          .fetch(state.rulesAcceptedRoleId)
+          .catch(() => null);
+        if (!role) {
+          return interaction.reply({
+            content: "Rules role missing. Ask an admin to rerun /setup.",
+            ephemeral: true,
+          });
+        }
 
-      const tier = normalizeTier(interaction.customId.replace(USER_MODAL_PREFIX, ""));
+        const member = await interaction.guild.members
+          .fetch(interaction.user.id)
+          .catch(() => null);
+        if (!member) return interaction.reply({ content: "Could not fetch member.", ephemeral: true });
 
-      const ign = interaction.fields.getTextInputValue("ign").trim();
-      const tribe = interaction.fields.getTextInputValue("tribe").trim();
-      const map = interaction.fields.getTextInputValue("map").trim();
-      const tribemates = (interaction.fields.getTextInputValue("tribemates") || "").trim();
+        if (member.roles.cache.has(role.id)) {
+          return interaction.reply({
+            content: "✅ You already accepted the rules. You can apply now.",
+            ephemeral: true,
+          });
+        }
 
-      if (ign.length < 2) return safeReply(interaction, { content: "❌ IGN is too short.", ephemeral: true });
-      if (tribe.length < 2) return safeReply(interaction, { content: "❌ Tribe is too short.", ephemeral: true });
-      if (map.length < 2) return safeReply(interaction, { content: "❌ Map is too short.", ephemeral: true });
-
-      const { ok, missing } = assertSetup(guild.id);
-      if (!ok) return safeReply(interaction, { content: `❌ Missing setup: ${missing.join(", ")}`, ephemeral: true });
-
-      // prune expired then check duplicates
-      const { kept } = pruneExpiredWithReport(loadWhiteflags());
-      let items = kept;
-
-      const dup = items.find(
-        (x) =>
-          x.guildId === guild.id &&
-          x.tribe.toLowerCase() === tribe.toLowerCase() &&
-          (x.status === "pending" || x.status === "active")
-      );
-      if (dup) {
-        return safeReply(interaction, { content: "❌ That tribe already has a pending/active whiteflag.", ephemeral: true });
+        await member.roles.add(role, "Accepted White Flag rules").catch(() => null);
+        return interaction.reply({
+          content: "✅ Thanks. You can now submit a White Flag application.",
+          ephemeral: true,
+        });
       }
 
-      const entry = {
-        id: makeId(),
-        guildId: guild.id,
-        tier,
-        ign,
-        tribe,
-        map,
-        tribemates: tribemates || null,
+      // Apply open -> show modal (only if rules accepted)
+      if (interaction.customId === CID.APPLY_OPEN) {
+        if (!interaction.guild) {
+          return interaction.reply({ content: "Guild only.", ephemeral: true });
+        }
+        if (!state.rulesAcceptedRoleId || !state.adminChannelId || !state.adminRoleId) {
+          return interaction.reply({
+            content: "Bot not setup yet. Ask an admin to run /setup.",
+            ephemeral: true,
+          });
+        }
+
+        const member = await interaction.guild.members
+          .fetch(interaction.user.id)
+          .catch(() => null);
+        if (!member) return interaction.reply({ content: "Could not fetch member.", ephemeral: true });
+
+        if (!member.roles.cache.has(state.rulesAcceptedRoleId)) {
+          return interaction.reply({
+            content: "You must read and accept the White Flag rules before submitting an application.",
+            ephemeral: true,
+          });
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId(CID.APPLY_MODAL)
+          .setTitle("White Flag Application");
+
+        const ign = new TextInputBuilder()
+          .setCustomId("ign")
+          .setLabel("IGN")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(64);
+
+        const tribe = new TextInputBuilder()
+          .setCustomId("tribe")
+          .setLabel("Tribe Name")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(64);
+
+        const cluster = new TextInputBuilder()
+          .setCustomId("cluster")
+          .setLabel("Cluster")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(64);
+
+        const map = new TextInputBuilder()
+          .setCustomId("map")
+          .setLabel("Map")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(64);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(ign),
+          new ActionRowBuilder().addComponents(tribe),
+          new ActionRowBuilder().addComponents(cluster),
+          new ActionRowBuilder().addComponents(map)
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      // Admin actions
+      if (
+        interaction.customId.startsWith(CID.ADMIN_APPROVE_PREFIX) ||
+        interaction.customId.startsWith(CID.ADMIN_DENY_PREFIX) ||
+        interaction.customId.startsWith(CID.ADMIN_END_EARLY_PREFIX)
+      ) {
+        if (!interaction.guild) return interaction.reply({ content: "Guild only.", ephemeral: true });
+
+        // Permission check: must have admin role OR Administrator permission
+        const member = await interaction.guild.members
+          .fetch(interaction.user.id)
+          .catch(() => null);
+        const isAdminPerm =
+          member?.permissions?.has(PermissionsBitField.Flags.Administrator) ?? false;
+        const hasAdminRole = state.adminRoleId ? member?.roles?.cache?.has(state.adminRoleId) : false;
+
+        if (!isAdminPerm && !hasAdminRole) {
+          return interaction.reply({ content: "Admins only.", ephemeral: true });
+        }
+
+        const requestId = interaction.customId.split(":")[1];
+        requests = readJson(REQUESTS_PATH, {});
+        const req = requests[requestId];
+        if (!req) {
+          return interaction.reply({ content: "Request not found (maybe already handled).", ephemeral: true });
+        }
+
+        // Approve
+        if (interaction.customId.startsWith(CID.ADMIN_APPROVE_PREFIX)) {
+          if (req.status !== "pending") {
+            return interaction.reply({ content: `Already ${req.status}.`, ephemeral: true });
+          }
+
+          req.status = "approved";
+          req.approvedAt = Date.now();
+          req.approvedBy = interaction.user.id;
+          requests[requestId] = req;
+          persist();
+
+          scheduleExpiry(requestId);
+
+          // Update admin message components: disable approve/deny, add "End Early" button
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`${CID.ADMIN_END_EARLY_PREFIX}${requestId}`)
+              .setLabel("🛑 End Early (Open Season)")
+              .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+              .setCustomId(`${CID.ADMIN_DENY_PREFIX}${requestId}`)
+              .setLabel("❌ Deny")
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId(`${CID.ADMIN_APPROVE_PREFIX}${requestId}`)
+              .setLabel("✅ Approved")
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(true)
+          );
+
+          await interaction.update({
+            content: interaction.message.content, // keep role ping if present
+            embeds: interaction.message.embeds,
+            components: [row],
+          });
+
+          // Optionally DM user
+          const guild = interaction.guild;
+          const user = await bot.users.fetch(req.requestedBy).catch(() => null);
+          if (user) {
+            user
+              .send(
+                `✅ Your White Flag request for **${req.tribeName}** was approved. Protection lasts 7 days from approval.`
+              )
+              .catch(() => null);
+          }
+
+          return;
+        }
+
+        // Deny
+        if (interaction.customId.startsWith(CID.ADMIN_DENY_PREFIX)) {
+          if (req.status !== "pending") {
+            return interaction.reply({ content: `Already ${req.status}.`, ephemeral: true });
+          }
+          req.status = "denied";
+          req.deniedAt = Date.now();
+          req.deniedBy = interaction.user.id;
+          requests[requestId] = req;
+          persist();
+
+          // Disable buttons
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`${CID.ADMIN_DENY_PREFIX}${requestId}`)
+              .setLabel("❌ Denied")
+              .setStyle(ButtonStyle.Danger)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId(`${CID.ADMIN_APPROVE_PREFIX}${requestId}`)
+              .setLabel("✅ Approve")
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(true)
+          );
+
+          await interaction.update({
+            content: interaction.message.content,
+            embeds: interaction.message.embeds,
+            components: [row],
+          });
+
+          const user = await bot.users.fetch(req.requestedBy).catch(() => null);
+          if (user) {
+            user
+              .send(
+                `❌ Your White Flag request for **${req.tribeName}** was denied. If you think this is a mistake, contact an admin.`
+              )
+              .catch(() => null);
+          }
+
+          return;
+        }
+
+        // End early -> Open Season ping
+        if (interaction.customId.startsWith(CID.ADMIN_END_EARLY_PREFIX)) {
+          if (req.status !== "approved") {
+            return interaction.reply({
+              content: `Cannot end early because status is **${req.status}**.`,
+              ephemeral: true,
+            });
+          }
+
+          // Cancel timer
+          const t = activeTimeouts.get(requestId);
+          if (t) clearTimeout(t);
+          activeTimeouts.delete(requestId);
+
+          req.status = "ended_early";
+          req.endedEarlyAt = Date.now();
+          req.endedEarlyBy = interaction.user.id;
+          requests[requestId] = req;
+          persist();
+
+          // Announce Open Season (ping role)
+          const announceCh = await interaction.guild.channels
+            .fetch(state.announceChannelId)
+            .catch(() => null);
+
+          if (announceCh && isTextChannel(announceCh)) {
+            await announceCh.send(
+              `<@&${state.openSeasonRoleId}> 🚨 **OPEN SEASON** — White Flag ended early for **${escapeMd(
+                req.tribeName
+              )}** (IGN: **${escapeMd(req.ign)}**). A bounty may be placed.`
+            );
+          }
+
+          // Update admin message: disable end early
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`${CID.ADMIN_END_EARLY_PREFIX}${requestId}`)
+              .setLabel("🛑 Ended Early")
+              .setStyle(ButtonStyle.Danger)
+              .setDisabled(true)
+          );
+
+          await interaction.update({
+            content: interaction.message.content,
+            embeds: interaction.message.embeds,
+            components: [row],
+          });
+
+          const user = await bot.users.fetch(req.requestedBy).catch(() => null);
+          if (user) {
+            user
+              .send(
+                `🚨 An admin ended your White Flag early for **${req.tribeName}**. Your tribe is now OPEN SEASON.`
+              )
+              .catch(() => null);
+          }
+
+          return;
+        }
+      }
+    }
+
+    // --- Modal submit ---
+    if (interaction.type === InteractionType.ModalSubmit) {
+      if (interaction.customId !== CID.APPLY_MODAL) return;
+      if (!interaction.guild) return interaction.reply({ content: "Guild only.", ephemeral: true });
+
+      if (!state.adminChannelId || !state.adminRoleId) {
+        return interaction.reply({
+          content: "Bot not setup yet. Ask an admin to run /setup.",
+          ephemeral: true,
+        });
+      }
+
+      // Re-check rules role gate
+      const member = await interaction.guild.members
+        .fetch(interaction.user.id)
+        .catch(() => null);
+      if (!member || !member.roles.cache.has(state.rulesAcceptedRoleId)) {
+        return interaction.reply({
+          content: "You must accept the rules before submitting an application.",
+          ephemeral: true,
+        });
+      }
+
+      const ign = interaction.fields.getTextInputValue("ign")?.trim();
+      const tribe = interaction.fields.getTextInputValue("tribe")?.trim();
+      const cluster = interaction.fields.getTextInputValue("cluster")?.trim();
+      const map = interaction.fields.getTextInputValue("map")?.trim();
+
+      if (!ign || !tribe || !cluster || !map) {
+        return interaction.reply({ content: "All fields are required.", ephemeral: true });
+      }
+
+      const requestId = newRequestId();
+      const req = {
+        id: requestId,
         status: "pending",
+        ign,
+        tribeName: tribe,
+        cluster,
+        map,
         requestedBy: interaction.user.id,
         requestedAt: Date.now(),
       };
 
-      items.push(entry);
-      saveWhiteflags(items);
+      requests = readJson(REQUESTS_PATH, {});
+      requests[requestId] = req;
+      persist();
 
-      const reviewMsg = await sendReview(guild, {
-        embeds: [buildReviewEmbed(entry)],
-        components: [buildReviewButtons(entry.id)],
-      });
-
-      if (!reviewMsg) {
-        // rollback if review channel missing
-        const after = loadWhiteflags().filter((x) => x.id !== entry.id);
-        saveWhiteflags(after);
-        return safeReply(interaction, { content: "❌ Review channel missing. Ask staff to run /setup.", ephemeral: true });
+      const adminCh = await interaction.guild.channels.fetch(state.adminChannelId).catch(() => null);
+      if (!adminCh || !isTextChannel(adminCh)) {
+        return interaction.reply({
+          content: "Admin channel not found. Ask an admin to rerun /setup.",
+          ephemeral: true,
+        });
       }
 
-      await sendModLog(
-        guild,
-        `📝 Whiteflag requested: **${tribe}** (${tier}) by <@${interaction.user.id}> — Pending staff review.`
+      const embed = new EmbedBuilder()
+        .setTitle("📥 New White Flag Application")
+        .addFields(
+          { name: "IGN", value: escapeMd(ign), inline: true },
+          { name: "Tribe Name", value: escapeMd(tribe), inline: true },
+          { name: "Cluster", value: escapeMd(cluster), inline: true },
+          { name: "Map", value: escapeMd(map), inline: true },
+          { name: "Requested By", value: `<@${interaction.user.id}>`, inline: false }
+        )
+        .setFooter({ text: `Request ID: ${requestId}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${CID.ADMIN_APPROVE_PREFIX}${requestId}`)
+          .setLabel("✅ Approve (Start 7 Days)")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`${CID.ADMIN_DENY_PREFIX}${requestId}`)
+          .setLabel("❌ Deny")
+          .setStyle(ButtonStyle.Danger)
       );
 
-      return safeReply(interaction, { content: "✅ Request submitted! Staff will review it.", ephemeral: true });
-    }
-
-    // ===================== USER BUTTONS (OPEN MODAL) =====================
-    if (interaction.isButton()) {
-      const guild = interaction.guild;
-      if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-
-      const s = getGuildSettings(guild.id);
-      if (s.openSeasonChannelId && interaction.channelId !== s.openSeasonChannelId) {
-        return safeReply(interaction, { content: "❌ Please use this in the open-season channel.", ephemeral: true });
-      }
-
-      if (interaction.customId === BTN_100X) return interaction.showModal(buildUserRequestModal("100x"));
-      if (interaction.customId === BTN_25X) return interaction.showModal(buildUserRequestModal("25x"));
-      return;
-    }
-
-    // ===================== SLASH COMMANDS =====================
-    if (!interaction.isChatInputCommand()) return;
-
-    const guild = interaction.guild;
-    if (!guild) return safeReply(interaction, { content: "❌ Must be used in a server.", ephemeral: true });
-
-    const cmd = interaction.commandName;
-    const isAdmin = isAdminMember(interaction.member);
-
-    if (cmd === "setup") {
-      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const openSeasonChannel = interaction.options.getChannel("open_season_channel", true);
-      const reviewChannel = interaction.options.getChannel("review_channel", true);
-      const modLogChannel = interaction.options.getChannel("mod_log_channel", true);
-
-      if (openSeasonChannel.type !== ChannelType.GuildText) {
-        return safeReply(interaction, { content: "❌ Open season must be a text channel.", ephemeral: true });
-      }
-      if (reviewChannel.type !== ChannelType.GuildText) {
-        return safeReply(interaction, { content: "❌ Review must be a text channel.", ephemeral: true });
-      }
-      if (modLogChannel.type !== ChannelType.GuildText) {
-        return safeReply(interaction, { content: "❌ Mod log must be a text channel.", ephemeral: true });
-      }
-
-      setGuildSettings(guild.id, {
-        openSeasonChannelId: openSeasonChannel.id,
-        reviewChannelId: reviewChannel.id,
-        modLogChannelId: modLogChannel.id,
+      // Ping admin role on submission
+      await adminCh.send({
+        content: `<@&${state.adminRoleId}> New White Flag application received.`,
+        embeds: [embed],
+        components: [row],
       });
 
-      return safeReply(interaction, {
-        content:
-          `✅ Setup complete.\n` +
-          `- Open season: <#${openSeasonChannel.id}> (ONLY early-expire announcements)\n` +
-          `- Review: <#${reviewChannel.id}>\n` +
-          `- Mod log: <#${modLogChannel.id}>`,
+      return interaction.reply({
+        content: "✅ Submitted! Admins have been notified.",
         ephemeral: true,
       });
     }
-
-    if (cmd === "setup_roles") {
-      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const role100x = interaction.options.getRole("role_100x", true);
-      const role25x = interaction.options.getRole("role_25x", true);
-
-      setGuildSettings(guild.id, { role100xId: role100x.id, role25xId: role25x.id });
-
-      return safeReply(interaction, {
-        content: `✅ Roles saved.\n- 100x: <@&${role100x.id}>\n- 25x: <@&${role25x.id}>`,
-        ephemeral: true,
-      });
-    }
-
-    if (cmd === "post_whiteflag_buttons") {
-      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const s = getGuildSettings(guild.id);
-      if (!s.openSeasonChannelId) return safeReply(interaction, { content: "❌ Run /setup first.", ephemeral: true });
-
-      const ch = await guild.channels.fetch(s.openSeasonChannelId).catch(() => null);
-      if (!ch) return safeReply(interaction, { content: "❌ Open season channel missing.", ephemeral: true });
-
-      await ch.send({
-        content: "Select a tier to submit a whiteflag request (staff approval required):",
-        components: [buildFormButtons()],
-      });
-
-      return safeReply(interaction, { content: "✅ Buttons posted.", ephemeral: true });
-    }
-
-    if (cmd === "rules") {
-      const rulesText =
-        "**🏳️ White Flag Rules**\n" +
-        "• Do not raid tribes with an active white flag.\n" +
-        "• White flag lasts **7 days** once approved.\n" +
-        "• Any abuse may result in removal and punishment.\n" +
-        "• Staff decision is final.\n";
-
-      await interaction.channel?.send({ content: rulesText }).catch(() => null);
-      return safeReply(interaction, { content: "✅ Rules posted.", ephemeral: true });
-    }
-
-    if (cmd === "whiteflag_list") {
-      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const { kept } = pruneExpiredWithReport(loadWhiteflags());
-      const pending = kept.filter((x) => x.guildId === guild.id && x.status === "pending");
-      const active = kept.filter((x) => x.guildId === guild.id && x.status === "active");
-
-      if (!pending.length && !active.length) {
-        return safeReply(interaction, { content: "No pending or active whiteflags.", ephemeral: true });
-      }
-
-      const lines = [];
-      if (pending.length) {
-        lines.push("**Pending:**");
-        for (const x of pending.sort((a, b) => a.requestedAt - b.requestedAt)) {
-          lines.push(`• **${x.tribe}** (${x.tier}) — IGN: ${x.ign} — Map: ${x.map}`);
-        }
-      }
-      if (active.length) {
-        lines.push("", "**Active:**");
-        for (const x of active.sort((a, b) => a.expiresAt - b.expiresAt)) {
-          lines.push(`• **${x.tribe}** (${x.tier}) expires <t:${Math.floor(x.expiresAt / 1000)}:R>`);
-        }
-      }
-
-      return safeReply(interaction, { content: lines.join("\n"), ephemeral: true });
-    }
-
-    // ✅ ONLY open-season announcement happens here
-    if (cmd === "whiteflag_end") {
-      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const tribeInput = interaction.options.getString("tribe", true);
-      const reason = interaction.options.getString("reason") || "No reason provided";
-
-      const { kept } = pruneExpiredWithReport(loadWhiteflags());
-      let items = kept;
-
-      const idx = items.findIndex(
-        (x) =>
-          x.guildId === guild.id &&
-          x.status === "active" &&
-          x.tribe.toLowerCase() === tribeInput.toLowerCase()
-      );
-
-      if (idx === -1) {
-        return safeReply(interaction, { content: "❌ No active whiteflag found for that tribe.", ephemeral: true });
-      }
-
-      const ended = items[idx];
-      items.splice(idx, 1);
-      saveWhiteflags(items);
-
-      await sendModLog(
-        guild,
-        `🛑 Whiteflag ended early: **${ended.tribe}** (${ended.tier}) by <@${interaction.user.id}> — Reason: ${reason}`
-      );
-
-      await sendOpenSeason(guild, {
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("🛑 Whiteflag Ended Early")
-            .addFields(
-              { name: "Tribe", value: ended.tribe, inline: true },
-              { name: "Tier", value: ended.tier, inline: true },
-              { name: "Reason", value: reason, inline: false }
-            ),
-        ],
-      });
-
-      await tryDM(client, ended.requestedBy, {
-        content:
-          `🛑 Your active whiteflag was ended early in **${guild.name}**.\n` +
-          `Tribe: **${ended.tribe}** (${ended.tier})\nReason: ${reason}`,
-      });
-
-      return safeReply(interaction, { content: `✅ Ended whiteflag for **${ended.tribe}**.`, ephemeral: true });
-    }
-
-    // Optional pings
-    if (cmd === "ping100x" || cmd === "ping25x") {
-      if (!isAdmin) return safeReply(interaction, { content: "❌ No permission.", ephemeral: true });
-
-      const s = getGuildSettings(guild.id);
-      const roleId = cmd === "ping100x" ? s.role100xId : s.role25xId;
-      const tierName = cmd === "ping100x" ? "100x" : "25x";
-
-      if (!roleId) return safeReply(interaction, { content: "❌ Run /setup_roles first.", ephemeral: true });
-
-      const msg = interaction.options.getString("message") || `Ping for ${tierName}`;
-      await interaction.channel?.send({
-        content: `<@&${roleId}> ${msg}`,
-        allowedMentions: { parse: ["roles"] },
-      }).catch(() => null);
-
-      return safeReply(interaction, { content: "✅ Ping sent.", ephemeral: true });
-    }
-
-    return safeReply(interaction, { content: "❓ Unknown command.", ephemeral: true });
   } catch (err) {
-    console.error("interactionCreate error:", err);
-    if (interaction.isRepliable()) {
-      await safeReply(interaction, { content: "❌ Something went wrong.", ephemeral: true });
+    console.error("interaction error:", err);
+    if (interaction && !interaction.replied && !interaction.deferred) {
+      try {
+        await interaction.reply({ content: "Something went wrong.", ephemeral: true });
+      } catch {}
     }
   }
 });
 
-// -------------------- login --------------------
-const token = process.env.DISCORD_TOKEN;
-if (!token) {
-  console.error("❌ Missing DISCORD_TOKEN in env.");
-  process.exit(1);
-}
-client.login(token);
+bot.login(TOKEN);
