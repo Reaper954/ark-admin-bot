@@ -1202,7 +1202,9 @@ bot.on("interactionCreate", async (interaction) => {
     if (interaction && !interaction.replied && !interaction.deferred) {
       try {
         await interaction.reply({ content: "Something went wrong.", ephemeral: true });
-      } catch {}
+      } catch (e) {
+        // ignore reply errors
+      }
     }
   }
 });

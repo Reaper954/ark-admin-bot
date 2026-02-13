@@ -1,12 +1,8 @@
-import js from "@eslint/js";
-
 export default [
-  js.configs.recommended,
-
   {
     files: ["**/*.js"],
+    // Flat config ignores (Railway/ESLint v9+ prefers this over .eslintignore)
     ignores: ["node_modules/**", "data/**"],
-
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "commonjs",
@@ -21,18 +17,11 @@ export default [
         clearTimeout: "readonly"
       }
     },
-
     rules: {
-      // Discord bots use console logging
       "no-console": "off",
-
-      // Don't fail builds for unused variables
       "no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
-
-      // Template strings & Discord formatting often trigger this
+      "no-undef": "error",
       "no-useless-escape": "off",
-
-      // Style rules (warnings only)
       semi: ["warn", "always"],
       quotes: ["warn", "double"]
     }
