@@ -82,6 +82,25 @@ const commands = [
     .addSubcommand((sc) =>
       sc.setName("active").setDescription("Show all active bounties (2 weeks).")
     ),
+  new SlashCommandBuilder()
+    .setName("bounty")
+    .setDescription("Create or remove bounties.")
+    .addSubcommand((sc) =>
+      sc
+        .setName("add")
+        .setDescription("Add/refresh a bounty for a tribe (2 weeks).")
+        .addStringOption((opt) => opt.setName("tribe").setDescription("Tribe name").setRequired(true))
+        .addStringOption((opt) => opt.setName("ign").setDescription("IGN (optional)").setRequired(false))
+        .addStringOption((opt) => opt.setName("server").setDescription("Server (optional)").setRequired(false))
+        .addStringOption((opt) => opt.setName("reason").setDescription("Reason (optional)").setRequired(false))
+    )
+    .addSubcommand((sc) =>
+      sc
+        .setName("remove")
+        .setDescription("Remove an active bounty by tribe or by ID.")
+        .addStringOption((opt) => opt.setName("tribe").setDescription("Tribe name").setRequired(false))
+        .addStringOption((opt) => opt.setName("id").setDescription("Bounty record ID").setRequired(false))
+    ),
 ].map((c) => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(TOKEN);

@@ -202,6 +202,18 @@ function getActiveApprovedForTribe(tribeName, excludeId = null) {
   return null;
 }
 
+
+function getActiveBountyForTribe(tribeName, excludeId = null) {
+  const key = normalizeTribeName(tribeName);
+  const now = Date.now();
+  for (const r of Object.values(requests)) {
+    if (excludeId && r?.id === excludeId) continue;
+    if (normalizeTribeName(r?.tribeName) !== key) continue;
+    if (hasActiveBounty(r, now)) return r;
+  }
+  return null;
+}
+
 async function ensureRulesAcceptedRole(guild) {
   // If state already has role id and it exists, use it
   if (state.rulesAcceptedRoleId) {
@@ -554,6 +566,37 @@ async function registerSlashCommands() {
       .addSubcommand((sc) =>
         sc.setName("active").setDescription("Show all active bounties (2 weeks).")
       ),
+    new SlashCommandBuilder()
+      .setName("bounty")
+      .setDescription("Create or remove bounties.")
+      .addSubcommand((sc) =>
+        sc
+          .setName("add")
+          .setDescription("Add/refresh a bounty for a tribe (2 weeks).")
+          .addStringOption((opt) =>
+            opt.setName("tribe").setDescription("Tribe name").setRequired(true)
+          )
+          .addStringOption((opt) =>
+            opt.setName("ign").setDescription("IGN (optional)").setRequired(false)
+          )
+          .addStringOption((opt) =>
+            opt.setName("server").setDescription("Server (optional)").setRequired(false)
+          )
+          .addStringOption((opt) =>
+            opt.setName("reason").setDescription("Reason (optional)").setRequired(false)
+          )
+      )
+      .addSubcommand((sc) =>
+        sc
+          .setName("remove")
+          .setDescription("Remove an active bounty by tribe or by ID.")
+          .addStringOption((opt) =>
+            opt.setName("tribe").setDescription("Tribe name").setRequired(false)
+          )
+          .addStringOption((opt) =>
+            opt.setName("id").setDescription("Bounty record ID").setRequired(false)
+          )
+      ),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -760,6 +803,230 @@ bot.on("interactionCreate", async (interaction) => {
           .setDescription(lines.join("\n").slice(0, 3900));
 
         return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+      // -------------------- Bounty control --------------------
+      if (interaction.commandName === "bounty") {
+        const guild = interaction.guild;
+        if (!guild) return interaction.reply({ content: "Guild only.", ephemeral: true });
+
+        const member = await guild.members.fetch(interaction.user.id).catch((e) => null);
+        const isAdminPerm =
+          member?.permissions?.has(PermissionsBitField.Flags.Administrator) ?? false;
+        const hasAdminRole = state.adminRoleId ? member?.roles?.cache?.has(state.adminRoleId) : false;
+
+        if (!isAdminPerm && !hasAdminRole) {
+          return interaction.reply({ content: "Admins only.", ephemeral: true });
+        }
+
+        const sub = interaction.options.getSubcommand();
+        requests = readJson(REQUESTS_PATH, {});
+
+        if (sub === "add") {
+          const tribe = interaction.options.getString("tribe", true).trim();
+          const ign = (interaction.options.getString("ign") || "").trim();
+          const server = (interaction.options.getString("server") || "").trim();
+          const reason = (interaction.options.getString("reason") || "").trim();
+
+          const existing = getActiveBountyForTribe(tribe);
+          const now = Date.now();
+
+          if (existing) {
+            existing.bounty = {
+              ...existing.bounty,
+              active: true,
+              startedAt: existing.bounty.startedAt || now,
+              endsAt: now + TWO_WEEKS_MS,
+              startedBy: existing.bounty.startedBy || interaction.user.id,
+              refreshedAt: now,
+              refreshedBy: interaction.user.id,
+              reason: reason || existing.bounty.reason || "Manual bounty refresh.",
+            };
+            if (ign) existing.ign = ign;
+            if (server) existing.serverType = server;
+
+            requests[existing.id] = existing;
+            persist();
+
+            scheduleBountyExpiry(existing.id);
+
+            return interaction.reply({
+              content:
+                `✅ Refreshed bounty for **${escapeMd(tribe)}**. Ends ${fmtDiscordRelativeTime(existing.bounty.endsAt)} (ID: \`${existing.id}\`).`,
+              ephemeral: true,
+            });
+          }
+
+          const id = newRequestId();
+          const record = {
+            id,
+            status: "bounty_only",
+            tribeName: tribe,
+            ign: ign || "N/A",
+            serverType: server || "N/A",
+            map: "N/A",
+            requestedBy: interaction.user.id,
+            requestedAt: now,
+            bounty: {
+              active: true,
+              startedAt: now,
+              endsAt: now + TWO_WEEKS_MS,
+              startedBy: interaction.user.id,
+              reason: reason || "Manual bounty created.",
+            },
+          };
+
+          requests[id] = record;
+          persist();
+          scheduleBountyExpiry(id);
+
+          const announceCh = await safeFetchChannel(guild, state.announceChannelId);
+          if (announceCh && isTextChannel(announceCh)) {
+            await announceCh.send(
+              `🎯 **BOUNTY ACTIVE** — **${escapeMd(record.tribeName)}** (IGN: **${escapeMd(
+                record.ign
+              )}**, Server: **${escapeMd(record.serverType)}**) — ends ${fmtDiscordRelativeTime(
+                record.bounty.endsAt
+              )}.`
+            );
+          }
+
+          return interaction.reply({
+            content:
+              `✅ Bounty added for **${escapeMd(record.tribeName)}**. Ends ${fmtDiscordRelativeTime(record.bounty.endsAt)} (ID: \`${id}\`).`,
+            ephemeral: true,
+          });
+        }
+
+        if (sub === "remove") {
+          const tribe = (interaction.options.getString("tribe") || "").trim();
+          const id = (interaction.options.getString("id") || "").trim();
+
+          if (!tribe && !id) {
+            return interaction.reply({
+              content: "Provide either **tribe** or **id**.",
+              ephemeral: true,
+            });
+          }
+
+          let target = null;
+          if (id) target = requests[id] || null;
+          if (!target && tribe) target = getActiveBountyForTribe(tribe);
+
+          if (!target || !target.bounty || !target.bounty.active) {
+            return interaction.reply({ content: "No active bounty found for that input.", ephemeral: true });
+          }
+
+          const t = activeBountyTimeouts.get(target.id);
+          if (t) clearTimeout(t);
+          activeBountyTimeouts.delete(target.id);
+
+          target.bounty.active = false;
+          target.bounty.removedAt = Date.now();
+          target.bounty.removedBy = interaction.user.id;
+
+          requests[target.id] = target;
+          persist();
+
+          const announceCh = await safeFetchChannel(guild, state.announceChannelId);
+          if (announceCh && isTextChannel(announceCh)) {
+            await announceCh.send(
+              `🛑 **BOUNTY REMOVED** — **${escapeMd(target.tribeName)}** (ID: \`${target.id}\`).`
+            );
+          }
+
+          return interaction.reply({
+            content: `✅ Removed bounty for **${escapeMd(target.tribeName)}** (ID: \`${target.id}\`).`,
+            ephemeral: true,
+          });
+        }
+      }
+
+      // -------------------- Tribe intelligence --------------------
+      if (interaction.commandName === "tribe") {
+        const guild = interaction.guild;
+        if (!guild) return interaction.reply({ content: "Guild only.", ephemeral: true });
+
+        const member = await guild.members.fetch(interaction.user.id).catch((e) => null);
+        const isAdminPerm =
+          member?.permissions?.has(PermissionsBitField.Flags.Administrator) ?? false;
+        const hasAdminRole = state.adminRoleId ? member?.roles?.cache?.has(state.adminRoleId) : false;
+
+        if (!isAdminPerm && !hasAdminRole) {
+          return interaction.reply({ content: "Admins only.", ephemeral: true });
+        }
+
+        const sub = interaction.options.getSubcommand();
+        const tribe = interaction.options.getString("tribe", true).trim();
+
+        requests = readJson(REQUESTS_PATH, {});
+        const key = normalizeTribeName(tribe);
+        const now = Date.now();
+
+        const entries = Object.values(requests)
+          .filter((r) => normalizeTribeName(r?.tribeName) === key)
+          .sort((a, b) => (b.requestedAt || 0) - (a.requestedAt || 0));
+
+        const activeWf = entries.find((r) => isApprovedAndActive(r, now)) || null;
+        const activeB = entries.find((r) => hasActiveBounty(r, now)) || null;
+
+        if (sub === "status") {
+          const lines = [];
+
+          if (activeWf) {
+            lines.push(
+              `🏳️ **White Flag:** ACTIVE — ends ${fmtDiscordRelativeTime(activeWf.approvedAt + SEVEN_DAYS_MS)} (ID: \`${activeWf.id}\`)`
+            );
+          } else {
+            lines.push("🏳️ **White Flag:** none active");
+          }
+
+          if (activeB) {
+            lines.push(
+              `🎯 **Bounty:** ACTIVE — ends ${fmtDiscordRelativeTime(activeB.bounty.endsAt)} (ID: \`${activeB.id}\`)`
+            );
+          } else {
+            lines.push("🎯 **Bounty:** none active");
+          }
+
+          const embed = new EmbedBuilder()
+            .setTitle(`🔎 Tribe Status — ${escapeMd(tribe)}`)
+            .setDescription(lines.join("\n"));
+
+          return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+
+        if (sub === "history") {
+          if (entries.length === 0) {
+            return interaction.reply({ content: "No records found for that tribe.", ephemeral: true });
+          }
+
+          const recent = entries.slice(0, 10);
+          const lines = recent.map((r) => {
+            const server = escapeMd(r.serverType || r.cluster || "N/A");
+            const status = escapeMd(r.status || "unknown");
+            const when = r.requestedAt ? fmtDiscordRelativeTime(r.requestedAt) : "N/A";
+
+            const wfPart =
+              r.status === "approved" && r.approvedAt
+                ? ` — WF ends ${fmtDiscordRelativeTime(r.approvedAt + SEVEN_DAYS_MS)}`
+                : "";
+
+            const bountyPart = r.bounty
+              ? ` — Bounty ${r.bounty.active ? "ACTIVE" : "inactive"} (ends ${
+                  r.bounty.endsAt ? fmtDiscordRelativeTime(r.bounty.endsAt) : "N/A"
+                })`
+              : "";
+
+            return `• \`${r.id}\` — **${status}** — Server: **${server}** — requested ${when}${wfPart}${bountyPart}`;
+          });
+
+          const embed = new EmbedBuilder()
+            .setTitle(`📚 Tribe History — ${escapeMd(tribe)}`)
+            .setDescription(lines.join("\n").slice(0, 3900));
+
+          return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
       }
 
 
